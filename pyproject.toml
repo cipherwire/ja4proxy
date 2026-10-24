@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ja4proxy"
+version = "0.1.0"
+description = "High-performance universal proxy server with browser TLS (JA4) and HTTP/2 impersonation"
+readme = "README.md"
+authors = [{ name = "cipherwire", email = "dev@cipherwire.link" }]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=41.0.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+ja4proxy = "ja4proxy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ja4proxy*"]
