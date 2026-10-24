@@ -1,0 +1,25 @@
+services:
+  ja4proxy:
+    image: ja4proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ja4proxy
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      - ja4proxy_certs:/root/.ja4proxy
+    environment:
+      - JA4PROXY_HOST=0.0.0.0
+      - JA4PROXY_PORT=8888
+      - JA4PROXY_PROFILE=chrome_133
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8888/https://httpbin.org/status/200"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  ja4proxy_certs:

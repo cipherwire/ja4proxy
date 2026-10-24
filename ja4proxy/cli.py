@@ -52,32 +52,57 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--host", default="127.0.0.1", help="Binding IP address.")
-@click.option("--port", "-p", default=8888, type=int, help="Port to listen on.")
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    envvar="JA4PROXY_HOST",
+    help="Binding IP address.",
+)
+@click.option(
+    "--port",
+    "-p",
+    default=8888,
+    type=int,
+    envvar="JA4PROXY_PORT",
+    help="Port to listen on.",
+)
 @click.option(
     "--profile",
     default="chrome_133",
+    envvar="JA4PROXY_PROFILE",
     help="Default browser profile (e.g. chrome_133, safari_16_0, firefox_133).",
 )
 @click.option(
     "--upstream-proxy",
     default=None,
+    envvar="JA4PROXY_UPSTREAM_PROXY",
     help="Default upstream proxy URL (e.g. socks5://user:pass@host:1080).",
 )
 @click.option(
     "--auth",
     default=None,
+    envvar="JA4PROXY_AUTH",
     help="Require username:password authentication for client connections.",
 )
 @click.option(
-    "--cert-dir", default=None, help="Directory to store CA and leaf certificates."
+    "--cert-dir",
+    default=None,
+    envvar="JA4PROXY_CERT_DIR",
+    help="Directory to store CA and leaf certificates.",
 )
 @click.option(
     "--allow-private-networks",
     is_flag=True,
+    envvar="JA4PROXY_ALLOW_PRIVATE_NETWORKS",
     help="Allow forwarding requests to private and loopback IP ranges.",
 )
-@click.option("--verbose", "-v", is_flag=True, help="Enable verbose debug logging.")
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    envvar="JA4PROXY_VERBOSE",
+    help="Enable verbose debug logging.",
+)
 def start(
     host: str,
     port: int,

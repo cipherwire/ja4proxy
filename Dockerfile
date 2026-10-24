@@ -4,6 +4,8 @@ FROM python:3.11-slim
 # Prevent Python from writing .pyc files & enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV JA4PROXY_HOST=0.0.0.0
+ENV JA4PROXY_PORT=8888
 
 WORKDIR /app
 
@@ -24,4 +26,4 @@ RUN pip install --no-cache-dir .
 EXPOSE 8888
 
 # Default entrypoint starts the proxy listening on all interfaces
-ENTRYPOINT ["ja4proxy", "start", "--host", "0.0.0.0", "--port", "8888"]
+ENTRYPOINT ["ja4proxy", "start"]

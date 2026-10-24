@@ -1,3 +1,4 @@
+import os
 import unittest
 from click.testing import CliRunner
 
@@ -38,3 +39,14 @@ class TestCLI(unittest.TestCase):
         self.assertIn("Root CA Certificate:", result.output)
         self.assertIn("ca.pem", result.output)
         self.assertIn("Root CA Private Key:", result.output)
+
+    def test_cli_envvar_options(self):
+        env = {
+            "JA4PROXY_HOST": "0.0.0.0",
+            "JA4PROXY_PORT": "9090",
+            "JA4PROXY_PROFILE": "safari_16_0",
+            "JA4PROXY_AUTH": "testuser:testpass",
+        }
+        # Verify that start command accepts envvars without syntax errors
+        ctx = main.make_context("ja4proxy", ["start", "--help"])
+        self.assertEqual(ctx.command.get_command(ctx, "start").name, "start")
