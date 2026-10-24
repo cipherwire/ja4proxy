@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import ipaddress
 import os
@@ -176,5 +177,28 @@ class CertificateAuthority:
                 except OSError:
                     pass
 
+            if len(self._leaf_cache) >= 1000:
+                oldest_key = next(iter(self._leaf_cache))
+                del self._leaf_cache[oldest_key]
+
             self._leaf_cache[clean_host] = ctx
             return ctx
+
+    async def get_ssl_context_for_host_async(self, host: str) -> ssl.SSLContext:
+        """Asynchronously retrieves or generates an SSLContext without blocking the event loop."""
+        h = host.strip()
+        if h.startswith("["):
+            end = h.find("]")
+            clean_host = h[1:end] if end != -1 else h
+        elif ":" in h:
+            parts = h.split(":")
+            clean_host = parts[0] if len(parts) == 2 else h
+        else:
+            clean_host = h
+
+        with self._lock:
+            if clean_host in self._leaf_cache:
+                return self._leaf_cache[clean_host]
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.get_ssl_context_for_host, host)

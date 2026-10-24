@@ -241,6 +241,56 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
 
+    async def test_client_proxy_authentication(self):
+        """Tests that configuring proxy authentication blocks unauthorized clients with HTTP 407."""
+        auth_server = ProxyServer(
+            host="127.0.0.1",
+            port=0,
+            auth="proxyuser:secretpass",
+            cert_dir=self.temp_dir,
+            allow_private_networks=True,
+        )
+        await auth_server.start()
+
+        try:
+            # 1. Unauthorized request without credentials -> 407
+            reader, writer = await asyncio.open_connection("127.0.0.1", auth_server.port)
+            req = (
+                f"GET /http://127.0.0.1:{auth_server.port}/test HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{auth_server.port}\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            writer.write(req.encode("utf-8"))
+            await writer.drain()
+
+            status_line = await reader.readline()
+            self.assertIn(b"407 Proxy Authentication Required", status_line)
+            writer.close()
+            await writer.wait_closed()
+
+            # 2. Authorized request with valid credentials -> 200 / processed
+            reader, writer = await asyncio.open_connection("127.0.0.1", auth_server.port)
+            auth_token = "proxyuser:secretpass".encode("utf-8")
+            b64_auth = struct.__dict__.get("b64", None)
+            import base64
+            auth_header = base64.b64encode(auth_token).decode("utf-8")
+
+            req_auth = (
+                f"GET /https://httpbin.org/status/200 HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{auth_server.port}\r\n"
+                f"Proxy-Authorization: Basic {auth_header}\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            writer.write(req_auth.encode("utf-8"))
+            await writer.drain()
+
+            status_line = await reader.readline()
+            self.assertIn(b"200 OK", status_line)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await auth_server.close()
+
 
 if __name__ == "__main__":
     unittest.main()

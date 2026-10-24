@@ -6,7 +6,11 @@ import threading
 from typing import Any
 
 from ja4proxy.engine.loader import resolve_native_library
-from ja4proxy.profiles import get_default_headers, normalize_profile
+from ja4proxy.profiles import (
+    get_canonical_header_order,
+    get_default_headers,
+    normalize_profile,
+)
 
 
 class EngineError(Exception):
@@ -132,6 +136,8 @@ class NativeEngine:
                 if v is not None:
                     merged_headers[k.lower()] = str(v)
 
+        header_order = get_canonical_header_order(prof, merged_headers)
+
         payload = {
             "sessionId": session_id,
             "tlsClientIdentifier": prof,
@@ -141,6 +147,7 @@ class NativeEngine:
             "isByteRequest": is_byte_req,
             "isByteResponse": True,
             "headers": merged_headers,
+            "headerOrder": header_order,
             "requestCookies": [],
             "proxyUrl": proxy_url,
             "timeoutSeconds": timeout_seconds,

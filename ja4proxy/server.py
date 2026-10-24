@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import http.client
 import ipaddress
 import logging
@@ -11,13 +12,19 @@ from typing import Any
 
 from ja4proxy.certs import CertificateAuthority
 from ja4proxy.engine.bridge import NativeEngine
-from ja4proxy.parser import Directive, extract_directives, parse_credentials
+from ja4proxy.parser import (
+    Directive,
+    extract_base_username,
+    extract_directives,
+    parse_credentials,
+)
 
 logger = logging.getLogger("ja4proxy")
 
 DEFAULT_IDLE_TIMEOUT: float = 15.0
 _DNS_CACHE_TTL: float = 120.0
 _DNS_CACHE: dict[str, tuple[bool, float]] = {}
+_DNS_LOCKS: dict[str, asyncio.Lock] = {}
 
 EXTRA_RESTRICTED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
@@ -68,7 +75,7 @@ async def is_ssrf_restricted(
     host: str, loop: asyncio.AbstractEventLoop | None = None
 ) -> bool:
     """
-    Watertight non-blocking SSRF inspection.
+    Watertight non-blocking SSRF inspection with singleflight in-flight deduplication.
     Validates bare IPv4, bracketed IPv6, bare IPv6, localhost hostnames,
     and asynchronously resolves domain names via the event loop threadpool
     with an in-memory TTL cache to prevent connection latency stalls.
@@ -91,31 +98,46 @@ async def is_ssrf_restricted(
     except ValueError:
         pass
 
-    # Check DNS resolution cache
     now = time.monotonic()
     if clean_lower in _DNS_CACHE:
         is_restricted, expiry = _DNS_CACHE[clean_lower]
         if now < expiry:
             return is_restricted
 
-    # 2. Asynchronously resolve domain name in event loop threadpool
-    ev_loop = loop or asyncio.get_running_loop()
-    try:
-        addr_infos = await ev_loop.getaddrinfo(clean_host, None)
-        is_restricted = False
-        for addr_info in addr_infos:
-            resolved_ip_str = addr_info[4][0]
-            try:
-                resolved_ip = ipaddress.ip_address(resolved_ip_str)
-                if is_ip_restricted(resolved_ip):
-                    is_restricted = True
-                    break
-            except ValueError:
-                pass
-        _DNS_CACHE[clean_lower] = (is_restricted, now + _DNS_CACHE_TTL)
-        return is_restricted
-    except (socket.gaierror, OSError):
-        pass
+    # Singleflight in-flight deduplication
+    if clean_lower not in _DNS_LOCKS:
+        _DNS_LOCKS[clean_lower] = asyncio.Lock()
+    lock = _DNS_LOCKS[clean_lower]
+
+    async with lock:
+        now = time.monotonic()
+        if clean_lower in _DNS_CACHE:
+            is_restricted, expiry = _DNS_CACHE[clean_lower]
+            if now < expiry:
+                return is_restricted
+
+        ev_loop = loop or asyncio.get_running_loop()
+        try:
+            addr_infos = await ev_loop.getaddrinfo(clean_host, None)
+            is_restricted = False
+            for addr_info in addr_infos:
+                resolved_ip_str = addr_info[4][0]
+                try:
+                    resolved_ip = ipaddress.ip_address(resolved_ip_str)
+                    if is_ip_restricted(resolved_ip):
+                        is_restricted = True
+                        break
+                except ValueError:
+                    pass
+
+            if len(_DNS_CACHE) >= 5000:
+                oldest = next(iter(_DNS_CACHE))
+                del _DNS_CACHE[oldest]
+
+            _DNS_CACHE[clean_lower] = (is_restricted, now + _DNS_CACHE_TTL)
+            return is_restricted
+        except (socket.gaierror, OSError):
+            pass
 
     return False
 
@@ -137,6 +159,7 @@ class ProxyServer:
         cert_dir: str | None = None,
         allow_private_networks: bool = False,
         upstream_proxy: str | None = None,
+        auth: str | None = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     ):
         self.host = host
@@ -144,12 +167,29 @@ class ProxyServer:
         self.default_profile = default_profile
         self.allow_private_networks = allow_private_networks
         self.upstream_proxy = upstream_proxy
+        self.auth = auth
+        if auth:
+            if ":" in auth:
+                self.auth_user, self.auth_pass = auth.split(":", 1)
+            else:
+                self.auth_user, self.auth_pass = auth, ""
+        else:
+            self.auth_user, self.auth_pass = None, None
+
         self.idle_timeout = idle_timeout
         self.ca = CertificateAuthority(cert_dir)
         self.engine = NativeEngine.get_instance()
         self._server: asyncio.Server | None = None
         self._closing = False
         self._active_tasks: set[asyncio.Task] = set()
+        self._pending_session_tasks: set[asyncio.Task] = set()
+
+    def _check_auth(self, username: str, password: str) -> bool:
+        """Validates credentials against configured auth requirements."""
+        if not self.auth:
+            return True
+        base_user = extract_base_username(username)
+        return base_user == self.auth_user and password == self.auth_pass
 
     async def start(self) -> None:
         """Starts the proxy server listening for connections."""
@@ -180,6 +220,8 @@ class ProxyServer:
                 task.cancel()
         if self._active_tasks:
             await asyncio.gather(*self._active_tasks, return_exceptions=True)
+        if self._pending_session_tasks:
+            await asyncio.gather(*self._pending_session_tasks, return_exceptions=True)
 
     def _handle_client_wrapper(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -283,7 +325,7 @@ class ProxyServer:
     async def _handle_socks5(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        """Handles binary SOCKS5 negotiation (RFC 1928) with directive extraction."""
+        """Handles binary SOCKS5 negotiation (RFC 1928) with directive extraction and authentication."""
         # 1. Read authentication methods
         nmethods_byte = await reader.read(1)
         if not nmethods_byte:
@@ -292,27 +334,50 @@ class ProxyServer:
         methods = await reader.read(nmethods)
 
         directive = Directive()
-        # Check if Username/Password auth (0x02) is supported
-        if b"\x02" in methods:
-            writer.write(b"\x05\x02")  # Accept username/password auth
+        if self.auth:
+            if b"\x02" not in methods:
+                writer.write(b"\x05\xFF")  # No acceptable authentication methods
+                await writer.drain()
+                return
+
+            writer.write(b"\x05\x02")  # Require username/password
             await writer.drain()
 
-            # Read subnegotiation: 0x01 <ulen> <username> <plen> <password>
             ver = await reader.read(1)
             if ver != b"\x01":
                 return
             ulen = (await reader.read(1))[0]
             uname = (await reader.read(ulen)).decode("utf-8", errors="replace")
             plen = (await reader.read(1))[0]
-            await reader.read(plen)
+            password = (await reader.read(plen)).decode("utf-8", errors="replace")
+
+            if not self._check_auth(uname, password):
+                writer.write(b"\x01\x01")  # Authentication failure
+                await writer.drain()
+                return
 
             directive = parse_credentials(uname)
-            writer.write(b"\x01\x00")  # Auth success
+            writer.write(b"\x01\x00")  # Authentication success
             await writer.drain()
         else:
-            # Fall back to No-Auth (0x00)
-            writer.write(b"\x05\x00")
-            await writer.drain()
+            if b"\x02" in methods:
+                writer.write(b"\x05\x02")
+                await writer.drain()
+
+                ver = await reader.read(1)
+                if ver != b"\x01":
+                    return
+                ulen = (await reader.read(1))[0]
+                uname = (await reader.read(ulen)).decode("utf-8", errors="replace")
+                plen = (await reader.read(1))[0]
+                await reader.read(plen)
+
+                directive = parse_credentials(uname)
+                writer.write(b"\x01\x00")
+                await writer.drain()
+            else:
+                writer.write(b"\x05\x00")
+                await writer.drain()
 
         # 2. Read SOCKS5 request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT
         req_hdr = await reader.read(4)
@@ -347,14 +412,12 @@ class ProxyServer:
             await writer.drain()
             return
 
-        # Reply Success: BND.ADDR 0.0.0.0, BND.PORT 0
-        writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-        await writer.drain()
-
-        # Now tunnel or intercept traffic
+        # Prepare SSL context before acknowledging SOCKS5 to ensure server is ready for TLS ClientHello
         if target_port == 443:
-            # Upgrade SOCKS connection to TLS with CA-signed leaf cert
             ssl_ctx = self.ca.get_ssl_context_for_host(target_host)
+            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+
             loop = asyncio.get_running_loop()
             transport = writer.transport
             protocol = transport.get_protocol()
@@ -365,7 +428,8 @@ class ProxyServer:
 
             await self._run_tls_http_loop(reader, writer, target_authority, directive)
         else:
-            # Plain HTTP over SOCKS
+            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
             await self._run_plain_http_loop(reader, writer, target_authority, directive)
 
     async def _handle_connect(
@@ -386,6 +450,27 @@ class ProxyServer:
                 k, v = decoded.split(":", 1)
                 headers[k.strip()] = v.strip()
 
+        # Enforce client proxy authentication if configured
+        if self.auth:
+            authorized = False
+            auth_hdr = {k.lower(): v for k, v in headers.items()}.get("proxy-authorization", "")
+            if auth_hdr.lower().startswith("basic "):
+                try:
+                    decoded = base64.b64decode(auth_hdr[6:].strip()).decode("utf-8")
+                    user, pwd = decoded.split(":", 1) if ":" in decoded else (decoded, "")
+                    if self._check_auth(user, pwd):
+                        authorized = True
+                except Exception:
+                    pass
+            if not authorized:
+                writer.write(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                    b"Proxy-Authenticate: Basic realm=\"ja4proxy\"\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
+
         clean_host, target_port = extract_host_port(target_authority, default_port=443)
 
         # Asynchronous SSRF Protection
@@ -396,13 +481,11 @@ class ProxyServer:
 
         directive, _ = extract_directives(headers)
 
-        # Acknowledge connection established
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
-
         if target_port == 443:
-            # Upgrade local connection to TLS
             ssl_ctx = self.ca.get_ssl_context_for_host(clean_host)
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+
             loop = asyncio.get_running_loop()
             transport = writer.transport
             protocol = transport.get_protocol()
@@ -413,7 +496,8 @@ class ProxyServer:
 
             await self._run_tls_http_loop(reader, writer, target_authority, directive)
         else:
-            # Tunnel plaintext HTTP without TLS interception
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
             await self._run_plain_http_loop(reader, writer, target_authority, directive)
 
     async def _run_tls_http_loop(
@@ -512,7 +596,9 @@ class ProxyServer:
             # Clean up ephemeral or single-connection sessions
             for s_id in used_sessions:
                 if s_id.startswith("tmp_") or s_id.startswith("ephemeral_"):
-                    asyncio.create_task(self.engine.destroy_session(s_id))
+                    task = asyncio.create_task(self.engine.destroy_session(s_id))
+                    self._pending_session_tasks.add(task)
+                    task.add_done_callback(self._pending_session_tasks.discard)
 
     async def _run_plain_http_loop(
         self,
@@ -606,7 +692,9 @@ class ProxyServer:
         finally:
             for s_id in used_sessions:
                 if s_id.startswith("tmp_") or s_id.startswith("ephemeral_"):
-                    asyncio.create_task(self.engine.destroy_session(s_id))
+                    task = asyncio.create_task(self.engine.destroy_session(s_id))
+                    self._pending_session_tasks.add(task)
+                    task.add_done_callback(self._pending_session_tasks.discard)
 
     async def _handle_plain_http(
         self,
@@ -617,6 +705,27 @@ class ProxyServer:
     ) -> None:
         """Handles plain HTTP gateway requests."""
         headers, body = await self._read_headers_and_body(reader)
+
+        # Enforce client proxy authentication if configured
+        if self.auth:
+            authorized = False
+            auth_hdr = {k.lower(): v for k, v in headers.items()}.get("proxy-authorization", "")
+            if auth_hdr.lower().startswith("basic "):
+                try:
+                    decoded = base64.b64decode(auth_hdr[6:].strip()).decode("utf-8")
+                    user, pwd = decoded.split(":", 1) if ":" in decoded else (decoded, "")
+                    if self._check_auth(user, pwd):
+                        authorized = True
+                except Exception:
+                    pass
+            if not authorized:
+                writer.write(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                    b"Proxy-Authenticate: Basic realm=\"ja4proxy\"\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
 
         if target_uri.startswith("/http://") or target_uri.startswith("/https://"):
             target_url = target_uri[1:]
@@ -680,7 +789,6 @@ class ProxyServer:
         status_line = f"HTTP/1.1 {status_code} {status_text}\r\n"
         writer.write(status_line.encode("utf-8"))
 
-        # Defensive fallback: engine error responses provide headers=None
         raw_headers = resp.get("headers") or {}
 
         # RFC 7230: 204 No Content and 304 Not Modified must not include body or Content-Length

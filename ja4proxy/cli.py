@@ -34,6 +34,11 @@ def main() -> None:
     help="Default upstream proxy URL (e.g. socks5://user:pass@host:1080).",
 )
 @click.option(
+    "--auth",
+    default=None,
+    help="Require username:password authentication for client connections.",
+)
+@click.option(
     "--cert-dir", default=None, help="Directory to store CA and leaf certificates."
 )
 @click.option(
@@ -47,6 +52,7 @@ def start(
     port: int,
     profile: str,
     upstream_proxy: str | None,
+    auth: str | None,
     cert_dir: str | None,
     allow_private_networks: bool,
     verbose: bool,
@@ -65,6 +71,7 @@ def start(
         cert_dir=cert_dir,
         allow_private_networks=allow_private_networks,
         upstream_proxy=upstream_proxy,
+        auth=auth,
     )
 
     ca_path = server.ca.ca_cert_path

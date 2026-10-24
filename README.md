@@ -630,6 +630,7 @@ Commands:
 | `--port` | `8888` | Port to listen for HTTP, HTTPS CONNECT, and SOCKS5 |
 | `--profile` | `chrome_133` | Default browser profile |
 | `--upstream-proxy` | None | Global upstream forwarding proxy |
+| `--auth` | None | Require username:password authentication for clients |
 | `--allow-private-networks` | False | Permits forwarding to private/internal IPs |
 | `--ca-dir` | `~/.ja4proxy` | Custom directory for CA certificates |
 
@@ -643,7 +644,7 @@ Run the full automated test suite covering CA generation, SOCKS5 state machines,
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-All 16 unit and live tests execute with zero warnings and zero regressions:
+All 18 unit and live tests execute with zero warnings and zero regressions:
 ```text
 test_ca_creation (test_certs.TestCertificateAuthority) ... ok
 test_leaf_cert_generation (test_certs.TestCertificateAuthority) ... ok
@@ -652,7 +653,9 @@ test_live_handshake_chrome (test_engine.TestNativeEngine) ... ok
 test_live_post_httpbin (test_engine.TestNativeEngine) ... ok
 test_bad_gateway_mapping_status_502 (test_live_proxy.TestLiveProxy) ... ok
 test_chunked_request_upload (test_live_proxy.TestLiveProxy) ... ok
+test_client_proxy_authentication (test_live_proxy.TestLiveProxy) ... ok
 test_gateway_mode_gzip (test_live_proxy.TestLiveProxy) ... ok
+test_safari_ios_headers (test_live_proxy.TestLiveProxy) ... ok
 test_socks5_ingress_tls_peet (test_live_proxy.TestLiveProxy) ... ok
 test_ssrf_protection_blocked (test_live_proxy.TestLiveProxy) ... ok
 test_ssrf_restricted_addresses (test_live_proxy.TestLiveProxy) ... ok
@@ -663,7 +666,7 @@ test_parse_credentials_proxy_with_hyphens (test_parser.TestParser) ... ok
 test_parse_credentials_tags (test_parser.TestParser) ... ok
 
 ----------------------------------------------------------------------
-Ran 16 tests in 5.588s
+Ran 18 tests in 6.164s
 
 OK
 ```

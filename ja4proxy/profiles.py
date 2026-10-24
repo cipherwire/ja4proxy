@@ -72,6 +72,72 @@ PROFILE_ALIASES: dict[str, str] = {
     "opera_89": "opera_89",
 }
 
+CHROME_CANONICAL_HEADER_ORDER = [
+    "host",
+    "connection",
+    "cache-control",
+    "device-memory",
+    "sec-ch-device-memory",
+    "dpr",
+    "sec-ch-dpr",
+    "viewport-width",
+    "sec-ch-viewport-width",
+    "rtt",
+    "downlink",
+    "ect",
+    "sec-ch-ua",
+    "sec-ch-ua-arch",
+    "sec-ch-ua-platform-version",
+    "sec-ch-ua-model",
+    "sec-ch-ua-full-version-list",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "upgrade-insecure-requests",
+    "user-agent",
+    "accept",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-user",
+    "sec-fetch-dest",
+    "referer",
+    "accept-encoding",
+    "accept-language",
+    "cookie",
+    "priority",
+]
+
+FIREFOX_CANONICAL_HEADER_ORDER = [
+    "host",
+    "user-agent",
+    "accept",
+    "accept-language",
+    "accept-encoding",
+    "connection",
+    "referer",
+    "cookie",
+    "upgrade-insecure-requests",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-user",
+    "priority",
+    "te",
+]
+
+SAFARI_CANONICAL_HEADER_ORDER = [
+    "host",
+    "accept",
+    "sec-fetch-site",
+    "accept-language",
+    "sec-fetch-mode",
+    "user-agent",
+    "referer",
+    "accept-encoding",
+    "cookie",
+    "sec-fetch-dest",
+    "connection",
+]
+
 
 def normalize_profile(name: str | None) -> str:
     """Normalizes alias or custom profile name to a supported native client identifier."""
@@ -212,3 +278,34 @@ def get_default_headers(profile: str) -> dict[str, str]:
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
     }
+
+
+def get_canonical_header_order(
+    profile: str, headers: dict[str, Any] | list[str]
+) -> list[str]:
+    """
+    Returns the canonical browser HTTP/2 and HTTP/1 header order for the profile.
+    Headers present in the canonical template are ordered first, followed by any
+    client-supplied custom headers.
+    """
+    prof = normalize_profile(profile)
+    if prof.startswith("firefox"):
+        template = FIREFOX_CANONICAL_HEADER_ORDER
+    elif prof.startswith("safari"):
+        template = SAFARI_CANONICAL_HEADER_ORDER
+    else:
+        template = CHROME_CANONICAL_HEADER_ORDER
+
+    present_keys = {
+        (k.lower() if isinstance(k, str) else str(k).lower())
+        for k in (headers if isinstance(headers, list) else headers.keys())
+    }
+
+    ordered = [h for h in template if h in present_keys]
+    seen = set(ordered)
+    for k in present_keys:
+        if k not in seen:
+            ordered.append(k)
+            seen.add(k)
+
+    return ordered

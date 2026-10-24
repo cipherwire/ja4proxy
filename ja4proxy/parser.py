@@ -17,6 +17,21 @@ class Directive:
     insecure_skip_verify: bool = False
 
 
+def extract_base_username(username: str) -> str:
+    """Extracts base username excluding routing directive tags."""
+    if not username:
+        return ""
+    match = re.search(
+        r"(?:^|[-_])(?:profile_|session_|proxy_|timeout_|insecure_|chrome|safari|firefox|opera)",
+        username,
+    )
+    if match:
+        idx = match.start()
+        base = username[:idx].rstrip("-_")
+        return base if base else username
+    return username
+
+
 def parse_credentials(username: str) -> Directive:
     """
     Parses directives from username tags without truncating hyphens in URLs.
