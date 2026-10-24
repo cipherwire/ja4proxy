@@ -171,19 +171,35 @@ Native C allocations returned by the Go runtime are wrapped in a structured memo
 
 ## Installation
 
+### Recommended: Install via PyPI
+
+```bash
+pip install ja4proxy
+```
+
+Verify your installation:
+
+```bash
+ja4proxy --help
+```
+
+### Via Docker & Docker Compose
+
+```bash
+# Clone the repository
+git clone https://github.com/cipherwire/ja4proxy.git
+cd ja4proxy
+
+# Start with Docker Compose
+docker compose up -d
+```
+
 ### Via Source
 
 ```bash
 git clone https://github.com/cipherwire/ja4proxy.git
 cd ja4proxy
-pip install .
-```
-
-### Via Docker
-
-```bash
-docker build -t ja4proxy .
-docker run -d -p 8888:8888 --name ja4proxy ja4proxy
+pip install -e .
 ```
 
 ---
@@ -192,20 +208,61 @@ docker run -d -p 8888:8888 --name ja4proxy ja4proxy
 
 ### 1. Launch the Server
 
+Start ja4proxy with default settings (127.0.0.1:8888, chrome_133 profile):
+
 ```bash
-ja4proxy start --host 127.0.0.1 --port 8888 --profile chrome_133
+ja4proxy start
 ```
 
-Output:
+Or configure custom binding, credentials, and browser impersonation:
+
+```bash
+ja4proxy start --host 0.0.0.0 --port 8888 --profile chrome_133 --auth username:password
+```
+
+Terminal Dashboard Output:
+
 ```text
-[*] ja4proxy v0.1.0 starting on http://127.0.0.1:8888
-[*] Default Profile: chrome_133
-[*] Protocols Supported: HTTP CONNECT, HTTP Gateway, SOCKS5 (Auto-detect)
-[*] CA Certificate: C:\Users\AnonNp\.ja4proxy\ca.pem
-[*] Ready for HTTP and SOCKS5 clients
+      _       __ __                             
+     (_)___ _/ // / ____  _________  _  ____  __
+    / / __ `/ // /_/ __ \/ ___/ __ \| |/_/ / / /
+   / / /_/ /__  __/ /_/ / /  / /_/ />  </ /_/ / 
+__/ /\__,_/  /_/ / .___/_/   \____/_/|_|\__, /  
+/___/            /_/                    /____/   
+  Universal Browser TLS & JA4 Impersonation Proxy
+  Version: 0.5.0  |  Docs: https://ja4proxy.cipherwire.link
+
+========================================================================
+ [*] Engine Status:   ONLINE
+ [*] HTTP Ingress:    http://0.0.0.0:8888
+ [*] SOCKS5 Ingress:  socks5://0.0.0.0:8888 (Auto-detect on same port)
+ [*] Active Profile:  chrome_133
+ [*] Upstream Proxy:  DIRECT
+ [*] Authentication:  Enabled (HTTP Basic / SOCKS5)
+ [*] SSRF Guard:      ENFORCED (RFC1918 & Loopback blocked)
+ [*] Root CA Path:    ~/.ja4proxy/ca.pem
+------------------------------------------------------------------------
+ Quick Test Command:
+   curl -x http://0.0.0.0:8888 https://tls.peet.ws/api/all
+========================================================================
 ```
 
-### 2. Export the Root CA
+### 2. Configuration Options
+
+ja4proxy can be configured via CLI flags or equivalent environment variables:
+
+| CLI Flag | Environment Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--host` | `JA4PROXY_HOST` | `127.0.0.1` | Network interface IP to bind. Use `0.0.0.0` for all interfaces. |
+| `-p`, `--port` | `JA4PROXY_PORT` | `8888` | Port to listen on (serves HTTP CONNECT, Gateway, and SOCKS5). |
+| `--profile` | `JA4PROXY_PROFILE` | `chrome_133` | Default browser preset (e.g. `chrome_133`, `firefox_133`, `safari_16_0`). |
+| `--auth` | `JA4PROXY_AUTH` | `None` | Optional `user:pass` authentication for clients. |
+| `--upstream-proxy` | `JA4PROXY_UPSTREAM_PROXY` | `None` | Upstream proxy URL to chain (e.g. `socks5://user:pass@host:1080`). |
+| `--cert-dir` | `JA4PROXY_CERT_DIR` | `~/.ja4proxy` | Directory to store generated Root CA and leaf certificates. |
+| `--allow-private-networks` | `JA4PROXY_ALLOW_PRIVATE_NETWORKS` | `False` | Disable SSRF guard to allow loopback/private IP routing. |
+| `-v`, `--verbose` | `JA4PROXY_VERBOSE` | `False` | Enable verbose debug logging. |
+
+### 3. Export the Root CA
 
 Export the root certificate so your HTTP client can verify intercept certificates without disabling SSL verification:
 
