@@ -271,7 +271,6 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
             # 2. Authorized request with valid credentials -> 200 / processed
             reader, writer = await asyncio.open_connection("127.0.0.1", auth_server.port)
             auth_token = "proxyuser:secretpass".encode("utf-8")
-            b64_auth = struct.__dict__.get("b64", None)
             import base64
             auth_header = base64.b64encode(auth_token).decode("utf-8")
 
@@ -290,6 +289,39 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
         finally:
             await auth_server.close()
+
+    async def test_connect_tls_handshake_timeout(self):
+        """Tests that a client stalling during TLS handshake is cleanly terminated by timeout."""
+        server = ProxyServer(
+            host="127.0.0.1",
+            port=0,
+            tls_handshake_timeout=0.5,
+            cert_dir=self.temp_dir,
+            allow_private_networks=True,
+        )
+        await server.start()
+
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            connect_req = (
+                f"CONNECT tls.peet.ws:443 HTTP/1.1\r\n"
+                f"Host: tls.peet.ws:443\r\n\r\n"
+            )
+            writer.write(connect_req.encode("utf-8"))
+            await writer.drain()
+
+            status_line = await reader.readline()
+            self.assertIn(b"200 Connection Established", status_line)
+            # Drain empty line after headers
+            await reader.readline()
+
+            # Client stalls without sending ClientHello; proxy should close on handshake timeout
+            data = await asyncio.wait_for(reader.read(100), timeout=2.0)
+            self.assertEqual(data, b"")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.close()
 
 
 if __name__ == "__main__":

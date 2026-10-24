@@ -22,6 +22,7 @@ from ja4proxy.parser import (
 logger = logging.getLogger("ja4proxy")
 
 DEFAULT_IDLE_TIMEOUT: float = 15.0
+DEFAULT_TLS_HANDSHAKE_TIMEOUT: float = 10.0
 _DNS_CACHE_TTL: float = 120.0
 _DNS_CACHE: dict[str, tuple[bool, float]] = {}
 _DNS_LOCKS: dict[str, asyncio.Lock] = {}
@@ -161,6 +162,7 @@ class ProxyServer:
         upstream_proxy: str | None = None,
         auth: str | None = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        tls_handshake_timeout: float = DEFAULT_TLS_HANDSHAKE_TIMEOUT,
     ):
         self.host = host
         self.port = port
@@ -177,6 +179,7 @@ class ProxyServer:
             self.auth_user, self.auth_pass = None, None
 
         self.idle_timeout = idle_timeout
+        self.tls_handshake_timeout = tls_handshake_timeout
         self.ca = CertificateAuthority(cert_dir)
         self.engine = NativeEngine.get_instance()
         self._server: asyncio.Server | None = None
@@ -414,16 +417,26 @@ class ProxyServer:
 
         # Prepare SSL context before acknowledging SOCKS5 to ensure server is ready for TLS ClientHello
         if target_port == 443:
-            ssl_ctx = self.ca.get_ssl_context_for_host(target_host)
+            ssl_ctx = await self.ca.get_ssl_context_for_host_async(target_host)
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
 
             loop = asyncio.get_running_loop()
             transport = writer.transport
             protocol = transport.get_protocol()
-            new_transport = await loop.start_tls(
-                transport, protocol, ssl_ctx, server_side=True
-            )
+            try:
+                new_transport = await asyncio.wait_for(
+                    loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
+                    timeout=self.tls_handshake_timeout,
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.debug(f"SOCKS5 TLS handshake failed or timed out for {target_host}: {exc}")
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
             writer._transport = new_transport
 
             await self._run_tls_http_loop(reader, writer, target_authority, directive)
@@ -482,16 +495,26 @@ class ProxyServer:
         directive, _ = extract_directives(headers)
 
         if target_port == 443:
-            ssl_ctx = self.ca.get_ssl_context_for_host(clean_host)
+            ssl_ctx = await self.ca.get_ssl_context_for_host_async(clean_host)
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
 
             loop = asyncio.get_running_loop()
             transport = writer.transport
             protocol = transport.get_protocol()
-            new_transport = await loop.start_tls(
-                transport, protocol, ssl_ctx, server_side=True
-            )
+            try:
+                new_transport = await asyncio.wait_for(
+                    loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
+                    timeout=self.tls_handshake_timeout,
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.debug(f"CONNECT TLS handshake failed or timed out for {clean_host}: {exc}")
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
             writer._transport = new_transport
 
             await self._run_tls_http_loop(reader, writer, target_authority, directive)
