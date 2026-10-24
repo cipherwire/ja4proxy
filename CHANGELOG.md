@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/cipherwire/ja4proxy/compare/v0.3.0...v0.4.0) (2026-10-24)
+
+
+### Features
+
+* add cyberpunk ascii banner and status dashboard to cli ([a829eee](https://github.com/cipherwire/ja4proxy/commit/a829eee820561c99f0179d09b2a51c4df97ef5e1))
+
 ## [0.3.0](https://github.com/cipherwire/ja4proxy/compare/v0.2.0...v0.3.0) (2026-10-24)
 
 
