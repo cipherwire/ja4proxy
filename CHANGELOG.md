@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/cipherwire/ja4proxy/compare/v0.4.0...v0.5.0) (2026-10-24)
+
+
+### Features
+
+* add full docker-compose support and cli environment variables ([669e07b](https://github.com/cipherwire/ja4proxy/commit/669e07ba85f63c2b7854d0726ca3d371e33c37f1))
+
 ## [0.4.0](https://github.com/cipherwire/ja4proxy/compare/v0.3.0...v0.4.0) (2026-10-24)
 
 
