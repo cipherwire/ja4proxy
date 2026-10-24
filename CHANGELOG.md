@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/cipherwire/ja4proxy/compare/v0.2.0...v0.3.0) (2026-10-24)
+
+
+### Features
+
+* add __main__.py entry point for python -m ja4proxy execution ([ca24232](https://github.com/cipherwire/ja4proxy/commit/ca24232309f9a4a3123c96e01f608922f67945ba))
+
+
+### Bug Fixes
+
+* wire async cert generation and add client tls handshake timeout ([69fbb91](https://github.com/cipherwire/ja4proxy/commit/69fbb91c9d1e07f6b4fea6d247fb1e08f7bf35f7))
+
 ## [0.2.0](https://github.com/cipherwire/ja4proxy/compare/v0.1.1...v0.2.0) (2026-10-24)
 
 
