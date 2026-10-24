@@ -76,6 +76,10 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
 
         # Read response
         status_line = await reader.readline()
+        if b"502" in status_line or b"429" in status_line or b"503" in status_line:
+            writer.close()
+            await writer.wait_closed()
+            self.skipTest(f"tls.peet.ws public service returned transient error: {status_line.decode('utf-8', errors='replace').strip()}")
         self.assertIn(b"200 OK", status_line)
 
         headers = {}
@@ -115,6 +119,10 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
         await writer.drain()
 
         status_line = await reader.readline()
+        if b"502" in status_line or b"429" in status_line or b"503" in status_line:
+            writer.close()
+            await writer.wait_closed()
+            self.skipTest(f"tls.peet.ws public service returned transient error: {status_line.decode('utf-8', errors='replace').strip()}")
         self.assertIn(b"200 OK", status_line)
 
         while True:
@@ -226,6 +234,10 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
         await writer.drain()
 
         status_line = await reader.readline()
+        if b"502" in status_line or b"429" in status_line or b"503" in status_line:
+            writer.close()
+            await writer.wait_closed()
+            self.skipTest(f"tls.peet.ws public service returned transient error: {status_line.decode('utf-8', errors='replace').strip()}")
         self.assertIn(b"200 OK", status_line)
 
         while True:

@@ -11,14 +11,26 @@ class TestNativeEngine(unittest.TestCase):
 
     def test_live_handshake_chrome(self):
         async def _run():
-            return await self.engine.request(
-                method="GET",
-                url="https://tls.peet.ws/api/all",
-                profile="chrome_133",
-                timeout_seconds=15,
-            )
+            last_res = None
+            for attempt in range(3):
+                try:
+                    res = await self.engine.request(
+                        method="GET",
+                        url="https://tls.peet.ws/api/all",
+                        profile="chrome_133",
+                        timeout_seconds=15,
+                    )
+                    if res.get("status") == 200:
+                        return res
+                    last_res = res
+                except Exception as exc:
+                    last_res = {"status": 0, "body": str(exc).encode()}
+                await asyncio.sleep(1.0 * (attempt + 1))
+            return last_res
 
         res = asyncio.run(_run())
+        if res and res.get("status") in (429, 502, 503, 504):
+            self.skipTest(f"tls.peet.ws rate limit or transient upstream status {res.get('status')}")
         self.assertEqual(res["status"], 200)
         self.assertTrue(len(res["body"]) > 0)
         data = json.loads(res["body"].decode("utf-8"))
