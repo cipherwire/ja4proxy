@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/cipherwire/ja4proxy/compare/v0.1.1...v0.2.0) (2026-10-24)
+
+
+### Features
+
+* canonical browser header order, client authentication, and ci timeouts ([204f27d](https://github.com/cipherwire/ja4proxy/commit/204f27dfc46c24fe7da18b3d3353ca6a164f3fa6))
+
 ## [0.1.1](https://github.com/cipherwire/ja4proxy/compare/v0.1.0...v0.1.1) (2026-10-24)
 
 
