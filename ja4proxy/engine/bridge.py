@@ -155,33 +155,33 @@ class NativeEngine:
         raw = await self.execute_async(payload)
 
         status_code = raw.get("status", 0)
-        raw_headers = raw.get("headers", {})
+        raw_headers = raw.get("headers") or {}
         used_protocol = raw.get("usedProtocol", "")
-
-        # Decode response body
         raw_body = raw.get("body", "")
-        body_bytes = b""
-        if isinstance(raw_body, str) and raw_body:
-            if raw_body.startswith("data:") and "," in raw_body:
-                raw_body = raw_body.split(",", 1)[1]
-            try:
-                body_bytes = base64.b64decode(raw_body)
-            except Exception:
-                body_bytes = raw_body.encode("utf-8")
 
-        # Map native failure (status 0) to 502 Bad Gateway
+        # Handle native engine failure (status 0) -> 502 Bad Gateway
         if status_code == 0:
             status_code = 502
-            error_msg = raw.get("errorMessage") or (
-                body_bytes.decode("utf-8", errors="replace")
-                if body_bytes
-                else "Bad Gateway: upstream connection failed"
+            error_msg = (
+                raw.get("errorMessage")
+                or (raw_body if isinstance(raw_body, str) else "")
+                or "Bad Gateway: upstream connection failed"
             )
             body_bytes = (
                 error_msg.encode("utf-8")
                 if isinstance(error_msg, str)
                 else error_msg
             )
+        else:
+            # Decode response body for real HTTP responses
+            body_bytes = b""
+            if isinstance(raw_body, str) and raw_body:
+                if raw_body.startswith("data:") and "," in raw_body:
+                    raw_body = raw_body.split(",", 1)[1]
+                try:
+                    body_bytes = base64.b64decode(raw_body)
+                except Exception:
+                    body_bytes = raw_body.encode("utf-8")
 
         return {
             "status": status_code,

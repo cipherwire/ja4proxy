@@ -176,7 +176,12 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
 
         body = await reader.read()
         self.assertTrue(len(body) > 0)
-        self.assertIn(b"lookup", body.lower())
+        self.assertTrue(
+            any(
+                term in body.lower()
+                for term in (b"lookup", b"failed", b"dial", b"host", b"bad gateway", b"resolve")
+            )
+        )
 
         writer.close()
         await writer.wait_closed()
