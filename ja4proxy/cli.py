@@ -26,7 +26,7 @@ def main() -> None:
 @click.option(
     "--profile",
     default="chrome_133",
-    help="Default browser profile (e.g. chrome_133, safari_18_0, firefox_133).",
+    help="Default browser profile (e.g. chrome_133, safari_16_0, firefox_133).",
 )
 @click.option(
     "--upstream-proxy",

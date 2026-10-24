@@ -5,6 +5,7 @@ import struct
 import tempfile
 import unittest
 
+from ja4proxy.profiles import get_default_headers
 from ja4proxy.server import ProxyServer, is_ssrf_restricted
 
 
@@ -24,31 +25,41 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.server.close()
 
-    def test_ssrf_restricted_addresses(self):
+    async def test_ssrf_restricted_addresses(self):
         """Validates watertight SSRF detection for IPv4, IPv6, CGNAT, and hostnames."""
         # Loopback and local addresses
-        self.assertTrue(is_ssrf_restricted("127.0.0.1"))
-        self.assertTrue(is_ssrf_restricted("127.0.0.1:8888"))
-        self.assertTrue(is_ssrf_restricted("::1"))
-        self.assertTrue(is_ssrf_restricted("[::1]:9999"))
-        self.assertTrue(is_ssrf_restricted("0.0.0.0"))
-        self.assertTrue(is_ssrf_restricted("0.0.0.0:80"))
-        self.assertTrue(is_ssrf_restricted("::ffff:127.0.0.1"))
-        self.assertTrue(is_ssrf_restricted("localhost"))
-        self.assertTrue(is_ssrf_restricted("localhost:8080"))
+        self.assertTrue(await is_ssrf_restricted("127.0.0.1"))
+        self.assertTrue(await is_ssrf_restricted("127.0.0.1:8888"))
+        self.assertTrue(await is_ssrf_restricted("::1"))
+        self.assertTrue(await is_ssrf_restricted("[::1]:9999"))
+        self.assertTrue(await is_ssrf_restricted("0.0.0.0"))
+        self.assertTrue(await is_ssrf_restricted("0.0.0.0:80"))
+        self.assertTrue(await is_ssrf_restricted("::ffff:127.0.0.1"))
+        self.assertTrue(await is_ssrf_restricted("localhost"))
+        self.assertTrue(await is_ssrf_restricted("localhost:8080"))
 
         # Private RFC 1918 subnets
-        self.assertTrue(is_ssrf_restricted("10.0.0.1"))
-        self.assertTrue(is_ssrf_restricted("172.16.5.10"))
-        self.assertTrue(is_ssrf_restricted("192.168.1.1"))
+        self.assertTrue(await is_ssrf_restricted("10.0.0.1"))
+        self.assertTrue(await is_ssrf_restricted("172.16.5.10"))
+        self.assertTrue(await is_ssrf_restricted("192.168.1.1"))
 
         # CGNAT & Cloud Metadata
-        self.assertTrue(is_ssrf_restricted("100.64.0.1"))
-        self.assertTrue(is_ssrf_restricted("169.254.169.254"))
+        self.assertTrue(await is_ssrf_restricted("100.64.0.1"))
+        self.assertTrue(await is_ssrf_restricted("169.254.169.254"))
 
         # Legitimate external hosts
-        self.assertFalse(is_ssrf_restricted("1.1.1.1"))
-        self.assertFalse(is_ssrf_restricted("tls.peet.ws"))
+        self.assertFalse(await is_ssrf_restricted("1.1.1.1"))
+        self.assertFalse(await is_ssrf_restricted("tls.peet.ws"))
+
+    def test_safari_ios_headers(self):
+        """Validates that iOS profiles synthesize authentic iPhone mobile headers."""
+        headers_18 = get_default_headers("safari_ios_18_0")
+        self.assertIn("iPhone", headers_18["user-agent"])
+        self.assertIn("Version/18.0", headers_18["user-agent"])
+
+        headers_17 = get_default_headers("safari_ios_17_0")
+        self.assertIn("iPhone", headers_17["user-agent"])
+        self.assertIn("Version/17.0", headers_17["user-agent"])
 
     async def test_gateway_mode_gzip(self):
         """Tests that gzipped upstream responses are properly un-encoded to avoid client crashes."""
@@ -137,7 +148,7 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
 
     async def test_bad_gateway_mapping_status_502(self):
-        """Tests that unresolvable upstream host returns HTTP 502 Bad Gateway instead of status 0."""
+        """Tests that unresolvable upstream host returns a complete 502 response with body and headers."""
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
 
         req = (
@@ -150,6 +161,22 @@ class TestLiveProxy(unittest.IsolatedAsyncioTestCase):
 
         status_line = await reader.readline()
         self.assertIn(b"502 Bad Gateway", status_line)
+
+        headers = {}
+        while True:
+            line = await reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            k, v = line.decode().split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+        # Headers must be cleanly written without crash
+        self.assertIn("content-length", headers)
+        self.assertIn("content-type", headers)
+
+        body = await reader.read()
+        self.assertTrue(len(body) > 0)
+        self.assertIn(b"lookup", body.lower())
 
         writer.close()
         await writer.wait_closed()

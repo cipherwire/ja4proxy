@@ -5,6 +5,7 @@ import logging
 import socket
 import ssl
 import struct
+import time
 import urllib.parse
 from typing import Any
 
@@ -13,6 +14,10 @@ from ja4proxy.engine.bridge import NativeEngine
 from ja4proxy.parser import Directive, extract_directives, parse_credentials
 
 logger = logging.getLogger("ja4proxy")
+
+DEFAULT_IDLE_TIMEOUT: float = 15.0
+_DNS_CACHE_TTL: float = 120.0
+_DNS_CACHE: dict[str, tuple[bool, float]] = {}
 
 EXTRA_RESTRICTED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
@@ -59,11 +64,14 @@ def is_ip_restricted(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return False
 
 
-def is_ssrf_restricted(host: str) -> bool:
+async def is_ssrf_restricted(
+    host: str, loop: asyncio.AbstractEventLoop | None = None
+) -> bool:
     """
-    Watertight SSRF inspection.
+    Watertight non-blocking SSRF inspection.
     Validates bare IPv4, bracketed IPv6, bare IPv6, localhost hostnames,
-    and resolves domain names via DNS to check underlying IP addresses.
+    and asynchronously resolves domain names via the event loop threadpool
+    with an in-memory TTL cache to prevent connection latency stalls.
     """
     clean_host, _ = extract_host_port(host)
     clean_lower = clean_host.lower()
@@ -83,17 +91,29 @@ def is_ssrf_restricted(host: str) -> bool:
     except ValueError:
         pass
 
-    # 2. Resolve domain name via DNS and test all resolved addresses
+    # Check DNS resolution cache
+    now = time.monotonic()
+    if clean_lower in _DNS_CACHE:
+        is_restricted, expiry = _DNS_CACHE[clean_lower]
+        if now < expiry:
+            return is_restricted
+
+    # 2. Asynchronously resolve domain name in event loop threadpool
+    ev_loop = loop or asyncio.get_running_loop()
     try:
-        addr_infos = socket.getaddrinfo(clean_host, None)
+        addr_infos = await ev_loop.getaddrinfo(clean_host, None)
+        is_restricted = False
         for addr_info in addr_infos:
             resolved_ip_str = addr_info[4][0]
             try:
                 resolved_ip = ipaddress.ip_address(resolved_ip_str)
                 if is_ip_restricted(resolved_ip):
-                    return True
+                    is_restricted = True
+                    break
             except ValueError:
                 pass
+        _DNS_CACHE[clean_lower] = (is_restricted, now + _DNS_CACHE_TTL)
+        return is_restricted
     except (socket.gaierror, OSError):
         pass
 
@@ -117,12 +137,14 @@ class ProxyServer:
         cert_dir: str | None = None,
         allow_private_networks: bool = False,
         upstream_proxy: str | None = None,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     ):
         self.host = host
         self.port = port
         self.default_profile = default_profile
         self.allow_private_networks = allow_private_networks
         self.upstream_proxy = upstream_proxy
+        self.idle_timeout = idle_timeout
         self.ca = CertificateAuthority(cert_dir)
         self.engine = NativeEngine.get_instance()
         self._server: asyncio.Server | None = None
@@ -319,8 +341,8 @@ class ProxyServer:
         target_port = struct.unpack("!H", port_bytes)[0]
         target_authority = f"{target_host}:{target_port}"
 
-        # SSRF Protection
-        if not self.allow_private_networks and is_ssrf_restricted(target_host):
+        # Asynchronous SSRF Protection
+        if not self.allow_private_networks and await is_ssrf_restricted(target_host):
             writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # Connection not allowed
             await writer.drain()
             return
@@ -366,8 +388,8 @@ class ProxyServer:
 
         clean_host, target_port = extract_host_port(target_authority, default_port=443)
 
-        # SSRF Protection
-        if not self.allow_private_networks and is_ssrf_restricted(clean_host):
+        # Asynchronous SSRF Protection
+        if not self.allow_private_networks and await is_ssrf_restricted(clean_host):
             writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\nRestricted target address")
             await writer.drain()
             return
@@ -402,90 +424,95 @@ class ProxyServer:
         initial_directive: Directive,
     ) -> None:
         """HTTP keep-alive loop over intercepted TLS."""
-        idle_timeout = (
-            initial_directive.timeout
-            if initial_directive.timeout is not None
-            else 60.0
-        )
+        used_sessions: set[str] = set()
 
-        while not reader.at_eof() and not self._closing:
-            try:
-                req_line_bytes = await asyncio.wait_for(
-                    reader.readline(), timeout=idle_timeout
+        try:
+            while not reader.at_eof() and not self._closing:
+                try:
+                    req_line_bytes = await asyncio.wait_for(
+                        reader.readline(), timeout=self.idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    break
+
+                if not req_line_bytes:
+                    break
+                req_line = req_line_bytes.decode("utf-8", errors="replace").strip()
+                if not req_line:
+                    continue
+                parts = req_line.split(" ")
+                if len(parts) < 2:
+                    break
+
+                method = parts[0].upper()
+                path = parts[1]
+                http_version = parts[2].upper() if len(parts) > 2 else "HTTP/1.1"
+
+                headers, body = await self._read_headers_and_body(reader)
+                target_url = f"https://{target_authority}{path}"
+
+                req_directive, clean_headers = extract_directives(headers)
+
+                # Directive priority: per-request header > initial auth directive > server default
+                profile_to_use = (
+                    req_directive.profile
+                    or initial_directive.profile
+                    or self.default_profile
                 )
-            except asyncio.TimeoutError:
-                break
-
-            if not req_line_bytes:
-                break
-            req_line = req_line_bytes.decode("utf-8", errors="replace").strip()
-            if not req_line:
-                continue
-            parts = req_line.split(" ")
-            if len(parts) < 2:
-                break
-
-            method = parts[0].upper()
-            path = parts[1]
-            http_version = parts[2].upper() if len(parts) > 2 else "HTTP/1.1"
-
-            headers, body = await self._read_headers_and_body(reader)
-            target_url = f"https://{target_authority}{path}"
-
-            req_directive, clean_headers = extract_directives(headers)
-
-            # Directive priority: per-request header > initial auth directive > server default
-            profile_to_use = (
-                req_directive.profile
-                or initial_directive.profile
-                or self.default_profile
-            )
-            proxy_to_use = (
-                req_directive.upstream_proxy
-                or initial_directive.upstream_proxy
-                or self.upstream_proxy
-                or ""
-            )
-            session_to_use = (
-                req_directive.session_id
-                or initial_directive.session_id
-                or "ja4_default"
-            )
-            timeout_to_use = (
-                req_directive.timeout
-                if req_directive.timeout is not None
-                else (
-                    initial_directive.timeout
-                    if initial_directive.timeout is not None
-                    else 30
+                proxy_to_use = (
+                    req_directive.upstream_proxy
+                    or initial_directive.upstream_proxy
+                    or self.upstream_proxy
+                    or ""
                 )
-            )
-            insecure_to_use = (
-                req_directive.insecure_skip_verify
-                or initial_directive.insecure_skip_verify
-            )
+                session_to_use = (
+                    req_directive.session_id
+                    or initial_directive.session_id
+                    or "ja4_default"
+                )
+                timeout_to_use = (
+                    req_directive.timeout
+                    if req_directive.timeout is not None
+                    else (
+                        initial_directive.timeout
+                        if initial_directive.timeout is not None
+                        else 30
+                    )
+                )
+                insecure_to_use = (
+                    req_directive.insecure_skip_verify
+                    or initial_directive.insecure_skip_verify
+                )
 
-            upstream_resp = await self.engine.request(
-                method=method,
-                url=target_url,
-                headers=clean_headers,
-                body=body if body else None,
-                profile=profile_to_use,
-                proxy_url=proxy_to_use,
-                timeout_seconds=timeout_to_use,
-                insecure_skip_verify=insecure_to_use,
-                session_id=session_to_use,
-            )
+                if session_to_use != "ja4_default":
+                    used_sessions.add(session_to_use)
 
-            await self._write_response(writer, upstream_resp)
+                upstream_resp = await self.engine.request(
+                    method=method,
+                    url=target_url,
+                    headers=clean_headers,
+                    body=body if body else None,
+                    profile=profile_to_use,
+                    proxy_url=proxy_to_use,
+                    timeout_seconds=timeout_to_use,
+                    insecure_skip_verify=insecure_to_use,
+                    session_id=session_to_use,
+                )
 
-            # Case-insensitive connection header inspection
-            lower_headers = {k.lower(): v.lower() for k, v in headers.items()}
-            conn_val = lower_headers.get("connection", "")
-            if conn_val == "close":
-                break
-            if http_version == "HTTP/1.0" and conn_val != "keep-alive":
-                break
+                await self._write_response(writer, upstream_resp)
+
+                # Case-insensitive connection header inspection
+                lower_headers = {k.lower(): v.lower() for k, v in headers.items()}
+                conn_val = lower_headers.get("connection", "")
+                if conn_val == "close":
+                    break
+                if http_version == "HTTP/1.0" and conn_val != "keep-alive":
+                    break
+        finally:
+            # Clean up ephemeral or single-connection sessions
+            for s_id in used_sessions:
+                if s_id.startswith("tmp_") or s_id.startswith("ephemeral_"):
+                    asyncio.create_task(self.engine.destroy_session(s_id))
 
     async def _run_plain_http_loop(
         self,
@@ -495,85 +522,91 @@ class ProxyServer:
         directive: Directive,
     ) -> None:
         """HTTP keep-alive loop over plain HTTP."""
-        idle_timeout = (
-            directive.timeout if directive.timeout is not None else 60.0
-        )
+        used_sessions: set[str] = set()
 
-        while not reader.at_eof() and not self._closing:
-            try:
-                req_line_bytes = await asyncio.wait_for(
-                    reader.readline(), timeout=idle_timeout
+        try:
+            while not reader.at_eof() and not self._closing:
+                try:
+                    req_line_bytes = await asyncio.wait_for(
+                        reader.readline(), timeout=self.idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    break
+
+                if not req_line_bytes:
+                    break
+                req_line = req_line_bytes.decode("utf-8", errors="replace").strip()
+                if not req_line:
+                    continue
+                parts = req_line.split(" ")
+                if len(parts) < 2:
+                    break
+
+                method = parts[0].upper()
+                path = parts[1]
+                http_version = parts[2].upper() if len(parts) > 2 else "HTTP/1.1"
+
+                headers, body = await self._read_headers_and_body(reader)
+                target_url = f"http://{target_authority}{path}"
+
+                req_directive, clean_headers = extract_directives(headers)
+                profile_to_use = (
+                    req_directive.profile
+                    or directive.profile
+                    or self.default_profile
                 )
-            except asyncio.TimeoutError:
-                break
-
-            if not req_line_bytes:
-                break
-            req_line = req_line_bytes.decode("utf-8", errors="replace").strip()
-            if not req_line:
-                continue
-            parts = req_line.split(" ")
-            if len(parts) < 2:
-                break
-
-            method = parts[0].upper()
-            path = parts[1]
-            http_version = parts[2].upper() if len(parts) > 2 else "HTTP/1.1"
-
-            headers, body = await self._read_headers_and_body(reader)
-            target_url = f"http://{target_authority}{path}"
-
-            req_directive, clean_headers = extract_directives(headers)
-            profile_to_use = (
-                req_directive.profile
-                or directive.profile
-                or self.default_profile
-            )
-            proxy_to_use = (
-                req_directive.upstream_proxy
-                or directive.upstream_proxy
-                or self.upstream_proxy
-                or ""
-            )
-            session_to_use = (
-                req_directive.session_id
-                or directive.session_id
-                or "ja4_default"
-            )
-            timeout_to_use = (
-                req_directive.timeout
-                if req_directive.timeout is not None
-                else (
-                    directive.timeout
-                    if directive.timeout is not None
-                    else 30
+                proxy_to_use = (
+                    req_directive.upstream_proxy
+                    or directive.upstream_proxy
+                    or self.upstream_proxy
+                    or ""
                 )
-            )
-            insecure_to_use = (
-                req_directive.insecure_skip_verify
-                or directive.insecure_skip_verify
-            )
+                session_to_use = (
+                    req_directive.session_id
+                    or directive.session_id
+                    or "ja4_default"
+                )
+                timeout_to_use = (
+                    req_directive.timeout
+                    if req_directive.timeout is not None
+                    else (
+                        directive.timeout
+                        if directive.timeout is not None
+                        else 30
+                    )
+                )
+                insecure_to_use = (
+                    req_directive.insecure_skip_verify
+                    or directive.insecure_skip_verify
+                )
 
-            upstream_resp = await self.engine.request(
-                method=method,
-                url=target_url,
-                headers=clean_headers,
-                body=body if body else None,
-                profile=profile_to_use,
-                proxy_url=proxy_to_use,
-                timeout_seconds=timeout_to_use,
-                insecure_skip_verify=insecure_to_use,
-                session_id=session_to_use,
-            )
+                if session_to_use != "ja4_default":
+                    used_sessions.add(session_to_use)
 
-            await self._write_response(writer, upstream_resp)
+                upstream_resp = await self.engine.request(
+                    method=method,
+                    url=target_url,
+                    headers=clean_headers,
+                    body=body if body else None,
+                    profile=profile_to_use,
+                    proxy_url=proxy_to_use,
+                    timeout_seconds=timeout_to_use,
+                    insecure_skip_verify=insecure_to_use,
+                    session_id=session_to_use,
+                )
 
-            lower_headers = {k.lower(): v.lower() for k, v in headers.items()}
-            conn_val = lower_headers.get("connection", "")
-            if conn_val == "close":
-                break
-            if http_version == "HTTP/1.0" and conn_val != "keep-alive":
-                break
+                await self._write_response(writer, upstream_resp)
+
+                lower_headers = {k.lower(): v.lower() for k, v in headers.items()}
+                conn_val = lower_headers.get("connection", "")
+                if conn_val == "close":
+                    break
+                if http_version == "HTTP/1.0" and conn_val != "keep-alive":
+                    break
+        finally:
+            for s_id in used_sessions:
+                if s_id.startswith("tmp_") or s_id.startswith("ephemeral_"):
+                    asyncio.create_task(self.engine.destroy_session(s_id))
 
     async def _handle_plain_http(
         self,
@@ -600,8 +633,8 @@ class ProxyServer:
         parsed = urllib.parse.urlparse(target_url)
         clean_host = parsed.hostname or ""
 
-        # SSRF Protection
-        if not self.allow_private_networks and is_ssrf_restricted(clean_host):
+        # Asynchronous SSRF Protection
+        if not self.allow_private_networks and await is_ssrf_restricted(clean_host):
             writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\nRestricted target address")
             await writer.drain()
             return
@@ -631,9 +664,9 @@ class ProxyServer:
     ) -> None:
         """
         Formats and writes HTTP response to client.
-        Strips hop-by-hop headers, handles RFC 7230 status 204/304,
-        maps invalid/zero status codes to 502 Bad Gateway, and ensures
-        true Content-Length without compression desync.
+        Safely falls back on None headers to prevent crash, handles RFC 7230 status 204/304,
+        maps invalid/zero status codes to 502 Bad Gateway with readable diagnostic body,
+        and guarantees true Content-Length without compression desync.
         """
         status_code = resp.get("status", 200)
         if not (100 <= status_code <= 599):
@@ -647,7 +680,8 @@ class ProxyServer:
         status_line = f"HTTP/1.1 {status_code} {status_text}\r\n"
         writer.write(status_line.encode("utf-8"))
 
-        raw_headers = resp.get("headers", {})
+        # Defensive fallback: engine error responses provide headers=None
+        raw_headers = resp.get("headers") or {}
 
         # RFC 7230: 204 No Content and 304 Not Modified must not include body or Content-Length
         if status_code in (204, 304):
@@ -665,14 +699,21 @@ class ProxyServer:
             "content-length",
         }
 
+        has_content_type = False
         for key, vals in raw_headers.items():
-            if key.lower() in stripped_headers:
+            k_lower = key.lower()
+            if k_lower in stripped_headers:
                 continue
+            if k_lower == "content-type":
+                has_content_type = True
             if isinstance(vals, list):
                 for v in vals:
                     writer.write(f"{key}: {v}\r\n".encode("utf-8"))
             else:
                 writer.write(f"{key}: {vals}\r\n".encode("utf-8"))
+
+        if not has_content_type and status_code >= 400:
+            writer.write(b"Content-Type: text/plain; charset=utf-8\r\n")
 
         # Explicitly set true uncompressed Content-Length
         writer.write(f"Content-Length: {len(body_bytes)}\r\n".encode("utf-8"))

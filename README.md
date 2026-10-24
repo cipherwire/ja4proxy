@@ -438,7 +438,7 @@ When connecting via plain HTTP gateway or custom client hooks, pass directives a
 
 | Header | Type | Description | Example |
 | :--- | :--- | :--- | :--- |
-| `X-JA4-Profile` | String | Target browser preset | `chrome_133`, `safari_18_0`, `firefox_133` |
+| `X-JA4-Profile` | String | Target browser preset | `chrome_133`, `safari_16_0`, `firefox_133` |
 | `X-JA4-Session` | String | Persistent session identifier | `client_worker_01` |
 | `X-JA4-Upstream-Proxy` | URL | Forwarding proxy endpoint | `http://user:pass@10.0.0.1:8080` |
 | `X-JA4-Timeout` | Integer | Connection timeout (seconds) | `30` |

@@ -50,6 +50,13 @@ PROFILE_ALIASES: dict[str, str] = {
     "safari_16_0": "safari_16_0",
     "safari15": "safari_15_6_1",
     "safari_15_6_1": "safari_15_6_1",
+    "safari_ios": "safari_ios_18_0",
+    "safari_ios18": "safari_ios_18_0",
+    "safari_ios_18": "safari_ios_18_0",
+    "safari_ios17": "safari_ios_17_0",
+    "safari_ios_17": "safari_ios_17_0",
+    "safari_ios16": "safari_ios_16_0",
+    "safari_ios_16": "safari_ios_16_0",
     "firefox": "firefox_133",
     "firefox-latest": "firefox_133",
     "firefox133": "firefox_133",
@@ -121,6 +128,29 @@ def get_default_headers(profile: str) -> dict[str, str]:
             "sec-fetch-dest": "document",
             "accept-language": "en-US,en;q=0.9",
             "accept-encoding": "gzip, deflate, br, zstd",
+        }
+
+    if prof.startswith("safari_ios"):
+        ios_ver = "16_0"
+        safari_ver = "16.0"
+        if "18" in prof:
+            ios_ver = "18_0"
+            safari_ver = "18.0"
+        elif "17" in prof:
+            ios_ver = "17_0"
+            safari_ver = "17.0"
+        elif "15" in prof:
+            ios_ver = "15_6"
+            safari_ver = "15.6"
+
+        return {
+            "user-agent": f"Mozilla/5.0 (iPhone; CPU iPhone OS {ios_ver} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{safari_ver} Mobile/15E148 Safari/604.1",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            "accept-encoding": "gzip, deflate, br",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
         }
 
     if prof.startswith("safari"):
