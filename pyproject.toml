@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ja4proxy"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance universal proxy server with browser TLS (JA4) and HTTP/2 impersonation"
 readme = "README.md"
 authors = [{ name = "cipherwire", email = "dev@cipherwire.link" }]
