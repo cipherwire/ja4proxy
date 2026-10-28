@@ -1,6 +1,6 @@
 """ja4proxy: High-performance universal proxy server with browser TLS (JA4) and HTTP/2 impersonation."""
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __author__ = "cipherwire"
 
 from ja4proxy.certs import (
