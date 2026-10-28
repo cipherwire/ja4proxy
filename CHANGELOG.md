@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/cipherwire/ja4proxy/compare/v0.6.0...v0.7.0) (2026-10-28)
+
+
+### Features
+
+* **ca:** implement RFC 5280 leaf extensions, reusable leaf key, combined bundle, and inject_trust SDK helper ([6282247](https://github.com/cipherwire/ja4proxy/commit/6282247c81903e9daba59ef4ba449279745e1fed))
+
+
+### Bug Fixes
+
+* **security:** ephemeral per-host keys, 14-day validity, exact SAN, robust CN uninstall, dynamic doctor verdict with --json, and track docs ([918288c](https://github.com/cipherwire/ja4proxy/commit/918288c7d872573258014553e760c03cd17de9de))
+
 ## [0.6.0](https://github.com/cipherwire/ja4proxy/compare/v0.5.0...v0.6.0) (2026-10-28)
 
 
