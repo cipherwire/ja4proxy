@@ -39,6 +39,18 @@ class TestCLI(unittest.TestCase):
         self.assertIn("Root CA Certificate:", result.output)
         self.assertIn("ca.pem", result.output)
         self.assertIn("Root CA Private Key:", result.output)
+        self.assertIn("ja4proxy ca install", result.output)
+
+    def test_cli_doctor_command_help(self):
+        result = self.runner.invoke(main, ["doctor", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Runs a 5-layer anti-bot evasion diagnostic", result.output)
+        self.assertIn("--profile", result.output)
+
+    def test_cli_ca_install_help(self):
+        result = self.runner.invoke(main, ["ca", "install", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Installs the Root CA into OS and Python certifi trust stores.", result.output)
 
     def test_cli_envvar_options(self):
         env = {

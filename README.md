@@ -262,15 +262,52 @@ ja4proxy can be configured via CLI flags or equivalent environment variables:
 | `--allow-private-networks` | `JA4PROXY_ALLOW_PRIVATE_NETWORKS` | `False` | Disable SSRF guard to allow loopback/private IP routing. |
 | `-v`, `--verbose` | `JA4PROXY_VERBOSE` | `False` | Enable verbose debug logging. |
 
-### 3. Export the Root CA
+### 3. One-Click CA Trust Installation (Zero SSL Errors)
 
-Export the root certificate so your HTTP client can verify intercept certificates without disabling SSL verification:
+Instead of passing `--cacert` or `-k` into every client command, install the ja4proxy Root CA directly into your OS and Python `certifi` trust stores:
 
 ```bash
+# Install CA into OS trust store and Python certifi
+ja4proxy ca install
+
+# To remove later
+ja4proxy ca uninstall
+```
+
+Once installed, standard tools (`curl`, Python `requests`, `httpx`, Node.js) verify intercepted connections natively with zero certificate errors.
+
+You can also inspect or export the certificate manually:
+
+```bash
+# Export root CA to a specific file
 ja4proxy ca --export ./ca.pem
 ```
 
-### 3. Verify TLS Handshake Against tls.peet.ws
+### 4. Anti-Bot Diagnostic Healthcheck (`ja4proxy doctor`)
+
+Verify upstream TLS, HTTP/2 Akamai framing, GREASE, post-quantum ML-KEM, and TCP transport consistency in one command:
+
+```bash
+ja4proxy doctor
+```
+
+Output:
+
+```text
+========================================================================
+  ja4proxy Diagnostic Healthcheck & Evasion Audit
+========================================================================
+ [*] TLS JA4 Signature:   t13d1516h2_8daaf6152771_d8a2da3f94cd
+ [*] Post-Quantum TLS:    X25519MLKEM768 Hybrid Key Exchange (Active)
+ [*] TLS GREASE Ciphers:  RFC 8701 Randomized (Active)
+ [*] HTTP/2 Transport:    Akamai Hash 52d84b11737d980a... (Valid h2)
+ [*] TCP/IP Hop TTL:      TTL 112 (Clean Transport)
+------------------------------------------------------------------------
+ Overall Anti-Bot Readiness: EXCELLENT (Cloudflare, Akamai, DataDome compatible)
+========================================================================
+```
+
+### 5. Verify TLS Handshake Against tls.peet.ws
 
 #### Using HTTP CONNECT:
 ```bash
