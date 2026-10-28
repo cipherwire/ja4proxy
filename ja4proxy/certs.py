@@ -5,6 +5,8 @@ import os
 import shutil
 import ssl
 import subprocess
+import sys
+import tempfile
 import threading
 
 from cryptography import x509
@@ -34,11 +36,46 @@ class CertificateAuthority:
 
         self.ca_cert_path = os.path.join(self.cert_dir, "ca.pem")
         self.ca_key_path = os.path.join(self.cert_dir, "ca.key")
+        self.combined_ca_path = os.path.join(self.cert_dir, "combined_ca.pem")
+        self.leaf_key_path = os.path.join(self.cert_dir, "leaf.key")
 
         self._lock = threading.Lock()
         self._leaf_cache: dict[str, ssl.SSLContext] = {}
 
         self._ensure_ca()
+
+    def build_combined_ca_bundle(self) -> str:
+        """
+        Creates or updates a combined CA bundle containing standard Mozilla roots plus ja4proxy CA.
+        Safe for use with REQUESTS_CA_BUNDLE and SSL_CERT_FILE without breaking non-proxied internet traffic.
+        """
+        mozilla_bundle = ""
+        try:
+            import certifi
+
+            certifi_path = certifi.where()
+            if os.path.exists(certifi_path):
+                with open(certifi_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                if CERTIFI_TAG_START in content:
+                    s = content.find(CERTIFI_TAG_START)
+                    e = content.find(CERTIFI_TAG_END) + len(CERTIFI_TAG_END)
+                    content = content[:s] + content[e:]
+                mozilla_bundle = content.strip()
+        except ImportError:
+            pass
+
+        with open(self.ca_cert_path, "r", encoding="utf-8") as f:
+            ca_pem = f.read().strip()
+
+        combined_content = (
+            f"{mozilla_bundle}\n\n{CERTIFI_TAG_START}\n{ca_pem}\n{CERTIFI_TAG_END}\n"
+            if mozilla_bundle
+            else f"{CERTIFI_TAG_START}\n{ca_pem}\n{CERTIFI_TAG_END}\n"
+        )
+        with open(self.combined_ca_path, "w", encoding="utf-8") as f:
+            f.write(combined_content)
+        return self.combined_ca_path
 
     def _ensure_ca(self) -> None:
         """Loads existing CA certificate/key or generates a fresh 10-year root CA."""
@@ -50,15 +87,26 @@ class CertificateAuthority:
             with open(self.ca_cert_path, "rb") as f:
                 self.ca_cert = x509.load_pem_x509_certificate(f.read())
             _set_private_file_permissions(self.ca_key_path)
+            self._ensure_leaf_key()
+            self.build_combined_ca_bundle()
             return
 
         # Generate fresh 2048-bit RSA key for CA
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        default_dir = os.path.join(os.path.expanduser("~"), ".ja4proxy")
+        if os.path.abspath(self.cert_dir) != os.path.abspath(default_dir):
+            import hashlib
+
+            short_id = hashlib.sha256(self.cert_dir.encode("utf-8")).hexdigest()[:8]
+            common_name = f"ja4proxy Root CA ({short_id})"
+        else:
+            common_name = "ja4proxy Root CA"
+
         ca_name = x509.Name(
             [
                 x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
                 x509.NameAttribute(NameOID.ORGANIZATION_NAME, "ja4proxy Development"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "ja4proxy Root CA"),
+                x509.NameAttribute(NameOID.COMMON_NAME, common_name),
             ]
         )
 
@@ -73,6 +121,10 @@ class CertificateAuthority:
             .not_valid_after(now + datetime.timedelta(days=3650))
             .add_extension(
                 x509.BasicConstraints(ca=True, path_length=None), critical=True
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(self.ca_key.public_key()),
+                critical=False,
             )
             .add_extension(
                 x509.KeyUsage(
@@ -104,6 +156,28 @@ class CertificateAuthority:
         with open(self.ca_cert_path, "wb") as f:
             f.write(self.ca_cert.public_bytes(serialization.Encoding.PEM))
 
+        self._ensure_leaf_key()
+        self.build_combined_ca_bundle()
+
+    def _ensure_leaf_key(self) -> None:
+        """Ensures a persistent 2048-bit RSA leaf private key exists for high-speed signing."""
+        if os.path.exists(self.leaf_key_path):
+            with open(self.leaf_key_path, "rb") as f:
+                self.leaf_key = serialization.load_pem_private_key(f.read(), password=None)
+            _set_private_file_permissions(self.leaf_key_path)
+            return
+
+        self.leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        with open(self.leaf_key_path, "wb") as f:
+            f.write(
+                self.leaf_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+        _set_private_file_permissions(self.leaf_key_path)
+
     def get_ssl_context_for_host(self, host: str) -> ssl.SSLContext:
         """
         Dynamically generates or retrieves a cached SSLContext for the target hostname,
@@ -123,63 +197,85 @@ class CertificateAuthority:
             if clean_host in self._leaf_cache:
                 return self._leaf_cache[clean_host]
 
-            leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
             subject_name = x509.Name(
                 [
                     x509.NameAttribute(NameOID.COMMON_NAME, clean_host),
                 ]
             )
 
+            san_items = []
             try:
                 ip_addr = ipaddress.ip_address(clean_host)
-                san = x509.SubjectAlternativeName([x509.IPAddress(ip_addr)])
+                san_items.append(x509.IPAddress(ip_addr))
             except ValueError:
-                san = x509.SubjectAlternativeName([x509.DNSName(clean_host)])
+                san_items.append(x509.DNSName(clean_host))
+                parts = clean_host.split(".")
+                if len(parts) >= 3 and not clean_host.startswith("*."):
+                    parent_domain = ".".join(parts[1:])
+                    if len(parts[-1]) >= 2:
+                        san_items.append(x509.DNSName(f"*.{parent_domain}"))
+
+            san = x509.SubjectAlternativeName(san_items)
 
             now = datetime.datetime.now(datetime.timezone.utc)
             leaf_cert = (
                 x509.CertificateBuilder()
                 .subject_name(subject_name)
                 .issuer_name(self.ca_cert.subject)
-                .public_key(leaf_key.public_key())
+                .public_key(self.leaf_key.public_key())
                 .serial_number(x509.random_serial_number())
-                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_before(now - datetime.timedelta(days=2))
                 .not_valid_after(now + datetime.timedelta(days=365))
                 .add_extension(
                     x509.BasicConstraints(ca=False, path_length=None), critical=True
                 )
                 .add_extension(san, critical=False)
+                .add_extension(
+                    x509.KeyUsage(
+                        digital_signature=True,
+                        content_commitment=False,
+                        key_encipherment=True,
+                        data_encipherment=False,
+                        key_agreement=False,
+                        key_cert_sign=False,
+                        crl_sign=False,
+                        encipher_only=False,
+                        decipher_only=False,
+                    ),
+                    critical=True,
+                )
+                .add_extension(
+                    x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH]),
+                    critical=False,
+                )
+                .add_extension(
+                    x509.SubjectKeyIdentifier.from_public_key(self.leaf_key.public_key()),
+                    critical=False,
+                )
+                .add_extension(
+                    x509.AuthorityKeyIdentifier.from_issuer_public_key(self.ca_key.public_key()),
+                    critical=False,
+                )
                 .sign(self.ca_key, hashes.SHA256())
             )
 
             cert_pem = leaf_cert.public_bytes(serialization.Encoding.PEM)
-            key_pem = leaf_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
 
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
-            leaf_cert_path = os.path.join(self.cert_dir, f"_leaf_{clean_host}.pem")
-            leaf_key_path = os.path.join(self.cert_dir, f"_leaf_{clean_host}.key")
-            with open(leaf_cert_path, "wb") as f:
-                f.write(cert_pem)
-            with open(leaf_key_path, "wb") as f:
-                f.write(key_pem)
-            _set_private_file_permissions(leaf_key_path)
+            with tempfile.NamedTemporaryFile("wb", suffix=".pem", dir=self.cert_dir, delete=False) as tf:
+                tf.write(cert_pem)
+                temp_cert_path = tf.name
 
             try:
-                ctx.load_cert_chain(certfile=leaf_cert_path, keyfile=leaf_key_path)
+                ctx.load_cert_chain(certfile=temp_cert_path, keyfile=self.leaf_key_path)
             finally:
                 try:
-                    os.remove(leaf_cert_path)
-                    os.remove(leaf_key_path)
+                    os.remove(temp_cert_path)
                 except OSError:
                     pass
 
-            if len(self._leaf_cache) >= 1000:
+            if len(self._leaf_cache) >= 2000:
                 oldest_key = next(iter(self._leaf_cache))
                 del self._leaf_cache[oldest_key]
 
@@ -231,7 +327,12 @@ def install_certifi_ca(ca_cert_path: str) -> tuple[bool, str]:
         bundle_content = f.read()
 
     if CERTIFI_TAG_START in bundle_content:
-        return True, f"ja4proxy Root CA already trusted in certifi ({certifi_path})."
+        if ca_pem in bundle_content:
+            return True, f"ja4proxy Root CA already trusted in certifi ({certifi_path})."
+        # If an existing (older or different) ja4proxy cert is present, replace it
+        start_idx = bundle_content.find(CERTIFI_TAG_START)
+        end_idx = bundle_content.find(CERTIFI_TAG_END) + len(CERTIFI_TAG_END)
+        bundle_content = (bundle_content[:start_idx] + bundle_content[end_idx:]).rstrip()
 
     new_content = (
         bundle_content.rstrip()
@@ -441,3 +542,44 @@ def uninstall_ca() -> list[str]:
     messages.append(f"{prefix_certifi} Python certifi: {msg_certifi}")
 
     return messages
+
+
+def get_ca_cert_path(cert_dir: str | None = None) -> str:
+    """Returns the absolute filesystem path to the ja4proxy Root CA certificate (ca.pem)."""
+    ca = CertificateAuthority(cert_dir=cert_dir)
+    return ca.ca_cert_path
+
+
+def get_ca_bundle_path(cert_dir: str | None = None) -> str:
+    """Returns the absolute filesystem path to the combined CA bundle (combined_ca.pem)."""
+    ca = CertificateAuthority(cert_dir=cert_dir)
+    return ca.build_combined_ca_bundle()
+
+
+def inject_trust(cert_dir: str | None = None) -> str:
+    """
+    Enables ja4proxy CA trust in the active Python process.
+    Configures environment variables, requests adapters, and native truststore if present.
+    Returns the path to the active combined CA bundle.
+    """
+    bundle_path = get_ca_bundle_path(cert_dir=cert_dir)
+    ca_path = get_ca_cert_path(cert_dir=cert_dir)
+
+    os.environ["REQUESTS_CA_BUNDLE"] = bundle_path
+    os.environ["CURL_CA_BUNDLE"] = bundle_path
+    os.environ["SSL_CERT_FILE"] = bundle_path
+    os.environ["NODE_EXTRA_CA_CERTS"] = ca_path
+
+    if "requests.adapters" in sys.modules:
+        setattr(sys.modules["requests.adapters"], "DEFAULT_CA_BUNDLE_PATH", bundle_path)
+    if "requests.utils" in sys.modules and hasattr(sys.modules["requests.utils"], "DEFAULT_CA_BUNDLE_PATH"):
+        setattr(sys.modules["requests.utils"], "DEFAULT_CA_BUNDLE_PATH", bundle_path)
+
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except (ImportError, AttributeError):
+        pass
+
+    return bundle_path

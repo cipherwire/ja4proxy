@@ -279,6 +279,7 @@ def manage_ca(
     sep = click.style("-" * 72, fg="bright_black")
     click.echo(sep)
     click.echo(f" {click.style('Root CA Certificate:', fg='bright_white', bold=True)} {ca.ca_cert_path}")
+    click.echo(f" {click.style('Combined CA Bundle:', fg='bright_white', bold=True)}  {ca.combined_ca_path}")
     click.echo(f" {click.style('Root CA Private Key:', fg='bright_white', bold=True)} {ca.ca_key_path}")
     click.echo(sep)
 
@@ -290,6 +291,7 @@ def manage_ca(
         click.echo(click.style(" Trust Store Commands:", fg="bright_white", bold=True))
         click.echo("   ja4proxy ca install            Install CA into OS & Python certifi trust stores")
         click.echo("   ja4proxy ca uninstall          Remove CA from system trust stores")
+        click.echo("   ja4proxy ca env                Print shell environment variables for CLI trust")
         click.echo("   ja4proxy ca --export ./ca.pem  Export CA to a specific file")
 
 
@@ -314,6 +316,40 @@ def ca_sub_uninstall() -> None:
     for m in msgs:
         color = "green" if m.startswith("[+]") else "yellow"
         click.echo(click.style(m, fg=color))
+
+
+@manage_ca.command(name="env")
+@click.option(
+    "--shell",
+    type=click.Choice(["bash", "zsh", "powershell", "cmd"]),
+    default=None,
+    help="Target shell syntax.",
+)
+def ca_sub_env(shell: str | None) -> None:
+    """Outputs shell environment variables to trust ja4proxy across CLI tools."""
+    ca = CertificateAuthority()
+    bundle = ca.build_combined_ca_bundle()
+    root_ca = ca.ca_cert_path
+
+    if shell is None:
+        shell = "powershell" if os.name == "nt" else "bash"
+
+    click.echo(f"# Environment configuration for ja4proxy CA ({shell}):")
+    if shell in ("bash", "zsh"):
+        click.echo(f'export REQUESTS_CA_BUNDLE="{bundle}"')
+        click.echo(f'export SSL_CERT_FILE="{bundle}"')
+        click.echo(f'export CURL_CA_BUNDLE="{bundle}"')
+        click.echo(f'export NODE_EXTRA_CA_CERTS="{root_ca}"')
+    elif shell == "powershell":
+        click.echo(f'$env:REQUESTS_CA_BUNDLE = "{bundle}"')
+        click.echo(f'$env:SSL_CERT_FILE = "{bundle}"')
+        click.echo(f'$env:CURL_CA_BUNDLE = "{bundle}"')
+        click.echo(f'$env:NODE_EXTRA_CA_CERTS = "{root_ca}"')
+    elif shell == "cmd":
+        click.echo(f'set REQUESTS_CA_BUNDLE={bundle}')
+        click.echo(f'set SSL_CERT_FILE={bundle}')
+        click.echo(f'set CURL_CA_BUNDLE={bundle}')
+        click.echo(f'set NODE_EXTRA_CA_CERTS={root_ca}')
 
 
 @main.command(name="test")

@@ -439,11 +439,17 @@ class ProxyServer:
                 return
             writer._transport = new_transport
 
-            await self._run_tls_http_loop(reader, writer, target_authority, directive)
+            try:
+                await self._run_tls_http_loop(reader, writer, target_authority, directive)
+            finally:
+                writer.close()
         else:
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
-            await self._run_plain_http_loop(reader, writer, target_authority, directive)
+            try:
+                await self._run_plain_http_loop(reader, writer, target_authority, directive)
+            finally:
+                writer.close()
 
     async def _handle_connect(
         self,
@@ -517,11 +523,17 @@ class ProxyServer:
                 return
             writer._transport = new_transport
 
-            await self._run_tls_http_loop(reader, writer, target_authority, directive)
+            try:
+                await self._run_tls_http_loop(reader, writer, target_authority, directive)
+            finally:
+                writer.close()
         else:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
-            await self._run_plain_http_loop(reader, writer, target_authority, directive)
+            try:
+                await self._run_plain_http_loop(reader, writer, target_authority, directive)
+            finally:
+                writer.close()
 
     async def _run_tls_http_loop(
         self,

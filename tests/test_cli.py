@@ -52,6 +52,13 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Installs the Root CA into OS and Python certifi trust stores.", result.output)
 
+    def test_cli_ca_env_command(self):
+        result = self.runner.invoke(main, ["ca", "env", "--shell", "powershell"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("$env:REQUESTS_CA_BUNDLE", result.output)
+        self.assertIn("$env:SSL_CERT_FILE", result.output)
+        self.assertIn("combined_ca.pem", result.output)
+
     def test_cli_envvar_options(self):
         env = {
             "JA4PROXY_HOST": "0.0.0.0",
