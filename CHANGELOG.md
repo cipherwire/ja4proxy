@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/cipherwire/ja4proxy/compare/v0.5.0...v0.6.0) (2026-10-28)
+
+
+### Features
+
+* add ja4proxy doctor diagnostic and one-click ca trust installation ([092504c](https://github.com/cipherwire/ja4proxy/commit/092504cc668d86aed60644a6ecd9ba33ad524b3c))
+
+
+### Documentation
+
+* add direct pip install and configuration reference to readme ([0072123](https://github.com/cipherwire/ja4proxy/commit/00721239045dd3505e9ae5b0a6e1636e42745111))
+
 ## [0.5.0](https://github.com/cipherwire/ja4proxy/compare/v0.4.0...v0.5.0) (2026-10-24)
 
 
