@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ja4proxy Documentation : Authentic Browser TLS & HTTP/2 Impersonation</title>
+  <meta name="description" content="Technical documentation for ja4proxy: Universal forward proxy server with authentic browser TLS/JA4 and HTTP/2 framing, Zero-GIL Go native engine, and connection-time SSRF isolation.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <!-- Top Sticky Header -->
+  <header class="site-header">
+    <div class="header-left">
+      <a href="#introduction" class="brand-anchor">
+        <span class="brand-dot"></span>
+        <span>ja4proxy</span>
+        <span class="brand-version">v0.6.0</span>
+      </a>
+
+      <div class="header-search" id="header-search-trigger">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <span>Search documentation...</span>
+        <kbd>Ctrl K</kbd>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <a href="https://github.com/cipherwire/ja4proxy" target="_blank" rel="noopener noreferrer" class="github-link">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+        </svg>
+        <span>GitHub</span>
+      </a>
+    </div>
+  </header>
+
+  <!-- 3-Column Documentation Layout Shell -->
+  <div class="docs-shell">
+
+    <!-- 1. Left Sidebar Navigation Tree -->
+    <aside class="docs-sidebar">
+      <div class="nav-group">
+        <div class="nav-group-title">Getting Started</div>
+        <ul class="nav-item-list">
+          <li><a href="#introduction" class="nav-item-link active" data-page="introduction">Introduction</a></li>
+          <li><a href="#quickstart" class="nav-item-link" data-page="quickstart">Quickstart</a></li>
+          <li><a href="#architecture" class="nav-item-link" data-page="architecture">Architecture</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">Ingress Protocols</div>
+        <ul class="nav-item-list">
+          <li><a href="#socks5" class="nav-item-link" data-page="socks5">SOCKS5 Proxy (RFC 1928)</a></li>
+          <li><a href="#http-connect" class="nav-item-link" data-page="http-connect">HTTP CONNECT Tunnel</a></li>
+          <li><a href="#gateway" class="nav-item-link" data-page="gateway">Transparent Gateway</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">Proxy Directives</div>
+        <ul class="nav-item-list">
+          <li><a href="#directives" class="nav-item-link" data-page="directives">Dynamic Tag Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">Signature Engine</div>
+        <ul class="nav-item-list">
+          <li><a href="#profiles" class="nav-item-link" data-page="profiles">Supported Profiles <span class="badge-sidebar">v1.16</span></a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">Client Integrations</div>
+        <ul class="nav-item-list">
+          <li><a href="#python-httpx" class="nav-item-link" data-page="python-httpx">Python (HTTPX Async)</a></li>
+          <li><a href="#python-requests" class="nav-item-link" data-page="python-requests">Python (Requests)</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title">Reference</div>
+        <ul class="nav-item-list">
+          <li><a href="#cli" class="nav-item-link" data-page="cli">CLI Command Reference</a></li>
+          <li><a href="#security" class="nav-item-link" data-page="security">Security & Guardrails</a></li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- 2. Center Content Canvas -->
+    <main class="docs-main-canvas" id="main-canvas">
+      <div class="breadcrumbs">
+        <span id="bc-category">Getting Started</span>
+        <span class="breadcrumb-sep">/</span>
+        <span class="breadcrumb-active" id="bc-page">Introduction to ja4proxy</span>
+      </div>
+
+      <header class="content-page-header">
+        <h1 class="page-title" id="page-title">Introduction to ja4proxy</h1>
+        <p class="page-description" id="page-desc">Production-grade universal forward proxy designed to defeat Layer 7 bot detection.</p>
+      </header>
+
+      <article class="markdown-body" id="page-body">
+        <!-- Rendered dynamically by JavaScript -->
+      </article>
+
+      <footer class="page-pagination" id="page-pagination">
+        <!-- Injected dynamically -->
+      </footer>
+    </main>
+
+    <!-- 3. Right Sidebar (On This Page TOC) -->
+    <aside class="docs-toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list" id="toc-list">
+        <!-- Populated dynamically -->
+      </ul>
+    </aside>
+
+  </div>
+
+  <!-- Spotlight Modal (Ctrl+K) -->
+  <div class="spotlight-modal" id="spotlight-modal">
+    <div class="spotlight-card">
+      <div class="spotlight-search-box">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input type="text" id="spotlight-input" class="spotlight-input" placeholder="Search pages, guides, CLI options...">
+        <kbd style="font-family:var(--font-mono);font-size:0.7rem;color:var(--text-dim);">ESC</kbd>
+      </div>
+      <div class="spotlight-results" id="spotlight-results">
+        <!-- Injected dynamically -->
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

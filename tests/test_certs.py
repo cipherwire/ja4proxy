@@ -8,10 +8,19 @@ from ja4proxy.certs import CertificateAuthority
 
 class TestCertificateAuthority(unittest.TestCase):
     def setUp(self):
+        self.old_env = {
+            k: os.environ.get(k)
+            for k in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")
+        }
         self.temp_dir = tempfile.mkdtemp()
         self.ca = CertificateAuthority(cert_dir=self.temp_dir)
 
     def tearDown(self):
+        for k, v in self.old_env.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_ca_creation(self):

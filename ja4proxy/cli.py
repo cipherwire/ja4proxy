@@ -416,13 +416,22 @@ def test_handshake(ctx: click.Context, profile: str, audit: bool) -> None:
     default=None,
     help="Optional upstream proxy URL to audit through (e.g. socks5://host:1080).",
 )
-def doctor_audit(profile: str, upstream_proxy: str | None) -> None:
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Output results in JSON format for automated CI / pipeline parsing.",
+)
+def doctor_audit(
+    profile: str, upstream_proxy: str | None, json_output: bool = False
+) -> None:
     """Runs a 5-layer anti-bot evasion diagnostic against tls.peet.ws."""
     import json
 
     prof = normalize_profile(profile)
-    click.echo(render_banner())
-    click.echo(f"[*] Running Anti-Bot Evasion Audit for profile: {click.style(prof, fg='yellow', bold=True)}...")
+    if not json_output:
+        click.echo(render_banner())
+        click.echo(f"[*] Running Anti-Bot Evasion Audit for profile: {click.style(prof, fg='yellow', bold=True)}...")
 
     async def _run_audit():
         engine = NativeEngine.get_instance()
@@ -437,17 +446,26 @@ def doctor_audit(profile: str, upstream_proxy: str | None) -> None:
     try:
         res = asyncio.run(_run_audit())
     except Exception as e:
-        click.echo(click.style(f"[-] Audit failed: Unable to connect to inspection endpoint: {e}", fg="red", bold=True))
+        if json_output:
+            click.echo(json.dumps({"status": "error", "message": f"Connection failed: {e}"}))
+        else:
+            click.echo(click.style(f"[-] Audit failed: Unable to connect to inspection endpoint: {e}", fg="red", bold=True))
         sys.exit(1)
 
     if res.get("status") != 200:
-        click.echo(click.style(f"[-] Inspection endpoint returned HTTP {res.get('status')}", fg="red", bold=True))
+        if json_output:
+            click.echo(json.dumps({"status": "error", "http_status": res.get("status")}))
+        else:
+            click.echo(click.style(f"[-] Inspection endpoint returned HTTP {res.get('status')}", fg="red", bold=True))
         sys.exit(1)
 
     try:
         body = json.loads(res["body"].decode("utf-8", errors="replace"))
     except Exception as e:
-        click.echo(click.style(f"[-] Failed to decode inspection payload: {e}", fg="red", bold=True))
+        if json_output:
+            click.echo(json.dumps({"status": "error", "message": f"Decode error: {e}"}))
+        else:
+            click.echo(click.style(f"[-] Failed to decode inspection payload: {e}", fg="red", bold=True))
         sys.exit(1)
 
     tls_info = body.get("tls", {})
@@ -466,6 +484,63 @@ def doctor_audit(profile: str, upstream_proxy: str | None) -> None:
     ttl = tcp_info.get("ip", {}).get("ttl", 0)
     p0f = tcp_info.get("p0f", "")
     client_ip = body.get("ip", "")
+
+    # Calculate real objective healthcheck score
+    checks_passed = 0
+    total_checks = 4
+
+    ja4_pass = bool(ja4 and ja4.startswith("t13"))
+    if ja4_pass:
+        checks_passed += 1
+
+    grease_pass = has_grease if "chrome" in prof else True
+    if grease_pass:
+        checks_passed += 1
+
+    h2_pass = (http_ver == "h2" and bool(akamai_hash))
+    if h2_pass:
+        checks_passed += 1
+
+    mlkem_pass = has_mlkem if "chrome" in prof else True
+    if mlkem_pass:
+        checks_passed += 1
+
+    if checks_passed == total_checks:
+        verdict = "EXCELLENT"
+        readiness = "EXCELLENT (Cloudflare, Akamai, DataDome compatible)"
+        verdict_color = "green"
+    elif checks_passed >= 3:
+        verdict = "GOOD"
+        readiness = "GOOD (Minor evasion discrepancies)"
+        verdict_color = "yellow"
+    else:
+        verdict = "POOR"
+        readiness = "POOR (Anti-bot evasion checks failed)"
+        verdict_color = "red"
+
+    if json_output:
+        result_json = {
+            "status": "ok",
+            "profile": prof,
+            "verdict": verdict,
+            "score": f"{checks_passed}/{total_checks}",
+            "tls": {
+                "ja4": ja4,
+                "has_grease": has_grease,
+                "has_mlkem": has_mlkem,
+            },
+            "http2": {
+                "version": http_ver,
+                "akamai_fingerprint_hash": akamai_hash,
+            },
+            "tcpip": {
+                "ttl": ttl,
+                "p0f": p0f,
+                "client_ip": client_ip,
+            },
+        }
+        click.echo(json.dumps(result_json, indent=2))
+        return
 
     sep = click.style("=" * 72, fg="cyan")
     divider = click.style("-" * 72, fg="bright_black")
@@ -508,8 +583,7 @@ def doctor_audit(profile: str, upstream_proxy: str | None) -> None:
     click.echo(f" {click.style('[*] TCP/IP Hop TTL:', fg='bright_white', bold=True)}      {tcp_note}")
 
     click.echo(divider)
-    readiness = "EXCELLENT (Cloudflare, Akamai, DataDome compatible)"
-    click.echo(f" {click.style('Overall Anti-Bot Readiness:', fg='bright_white', bold=True)} {click.style(readiness, fg='green', bold=True)}")
+    click.echo(f" {click.style('Overall Anti-Bot Readiness:', fg='bright_white', bold=True)} {click.style(readiness, fg=verdict_color, bold=True)}")
     click.echo(sep)
 
 

@@ -46,6 +46,7 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Runs a 5-layer anti-bot evasion diagnostic", result.output)
         self.assertIn("--profile", result.output)
+        self.assertIn("--json", result.output)
 
     def test_cli_ca_install_help(self):
         result = self.runner.invoke(main, ["ca", "install", "--help"])

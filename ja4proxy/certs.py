@@ -37,7 +37,6 @@ class CertificateAuthority:
         self.ca_cert_path = os.path.join(self.cert_dir, "ca.pem")
         self.ca_key_path = os.path.join(self.cert_dir, "ca.key")
         self.combined_ca_path = os.path.join(self.cert_dir, "combined_ca.pem")
-        self.leaf_key_path = os.path.join(self.cert_dir, "leaf.key")
 
         self._lock = threading.Lock()
         self._leaf_cache: dict[str, ssl.SSLContext] = {}
@@ -57,10 +56,11 @@ class CertificateAuthority:
             if os.path.exists(certifi_path):
                 with open(certifi_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-                if CERTIFI_TAG_START in content:
+                if CERTIFI_TAG_START in content and CERTIFI_TAG_END in content:
                     s = content.find(CERTIFI_TAG_START)
-                    e = content.find(CERTIFI_TAG_END) + len(CERTIFI_TAG_END)
-                    content = content[:s] + content[e:]
+                    e = content.find(CERTIFI_TAG_END)
+                    if s != -1 and e != -1 and e >= s:
+                        content = content[:s] + content[e + len(CERTIFI_TAG_END) :]
                 mozilla_bundle = content.strip()
         except ImportError:
             pass
@@ -87,7 +87,6 @@ class CertificateAuthority:
             with open(self.ca_cert_path, "rb") as f:
                 self.ca_cert = x509.load_pem_x509_certificate(f.read())
             _set_private_file_permissions(self.ca_key_path)
-            self._ensure_leaf_key()
             self.build_combined_ca_bundle()
             return
 
@@ -156,32 +155,13 @@ class CertificateAuthority:
         with open(self.ca_cert_path, "wb") as f:
             f.write(self.ca_cert.public_bytes(serialization.Encoding.PEM))
 
-        self._ensure_leaf_key()
         self.build_combined_ca_bundle()
-
-    def _ensure_leaf_key(self) -> None:
-        """Ensures a persistent 2048-bit RSA leaf private key exists for high-speed signing."""
-        if os.path.exists(self.leaf_key_path):
-            with open(self.leaf_key_path, "rb") as f:
-                self.leaf_key = serialization.load_pem_private_key(f.read(), password=None)
-            _set_private_file_permissions(self.leaf_key_path)
-            return
-
-        self.leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        with open(self.leaf_key_path, "wb") as f:
-            f.write(
-                self.leaf_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.TraditionalOpenSSL,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            )
-        _set_private_file_permissions(self.leaf_key_path)
 
     def get_ssl_context_for_host(self, host: str) -> ssl.SSLContext:
         """
         Dynamically generates or retrieves a cached SSLContext for the target hostname,
         signed by this CA with appropriate Subject Alternative Names (SAN).
+        Uses unique ephemeral per-host keys and short 14-day validity for security.
         """
         h = host.strip()
         if h.startswith("["):
@@ -197,35 +177,30 @@ class CertificateAuthority:
             if clean_host in self._leaf_cache:
                 return self._leaf_cache[clean_host]
 
+            # Generate unique ephemeral 2048-bit RSA key for this host
+            leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
             subject_name = x509.Name(
                 [
                     x509.NameAttribute(NameOID.COMMON_NAME, clean_host),
                 ]
             )
 
-            san_items = []
             try:
                 ip_addr = ipaddress.ip_address(clean_host)
-                san_items.append(x509.IPAddress(ip_addr))
+                san = x509.SubjectAlternativeName([x509.IPAddress(ip_addr)])
             except ValueError:
-                san_items.append(x509.DNSName(clean_host))
-                parts = clean_host.split(".")
-                if len(parts) >= 3 and not clean_host.startswith("*."):
-                    parent_domain = ".".join(parts[1:])
-                    if len(parts[-1]) >= 2:
-                        san_items.append(x509.DNSName(f"*.{parent_domain}"))
-
-            san = x509.SubjectAlternativeName(san_items)
+                san = x509.SubjectAlternativeName([x509.DNSName(clean_host)])
 
             now = datetime.datetime.now(datetime.timezone.utc)
             leaf_cert = (
                 x509.CertificateBuilder()
                 .subject_name(subject_name)
                 .issuer_name(self.ca_cert.subject)
-                .public_key(self.leaf_key.public_key())
+                .public_key(leaf_key.public_key())
                 .serial_number(x509.random_serial_number())
                 .not_valid_before(now - datetime.timedelta(days=2))
-                .not_valid_after(now + datetime.timedelta(days=365))
+                .not_valid_after(now + datetime.timedelta(days=14))
                 .add_extension(
                     x509.BasicConstraints(ca=False, path_length=None), critical=True
                 )
@@ -249,7 +224,7 @@ class CertificateAuthority:
                     critical=False,
                 )
                 .add_extension(
-                    x509.SubjectKeyIdentifier.from_public_key(self.leaf_key.public_key()),
+                    x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()),
                     critical=False,
                 )
                 .add_extension(
@@ -260,20 +235,31 @@ class CertificateAuthority:
             )
 
             cert_pem = leaf_cert.public_bytes(serialization.Encoding.PEM)
+            key_pem = leaf_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
 
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
-            with tempfile.NamedTemporaryFile("wb", suffix=".pem", dir=self.cert_dir, delete=False) as tf:
-                tf.write(cert_pem)
-                temp_cert_path = tf.name
+            with tempfile.NamedTemporaryFile("wb", suffix=".pem", dir=self.cert_dir, delete=False) as f_cert:
+                f_cert.write(cert_pem)
+                temp_cert_path = f_cert.name
+
+            with tempfile.NamedTemporaryFile("wb", suffix=".key", dir=self.cert_dir, delete=False) as f_key:
+                f_key.write(key_pem)
+                temp_key_path = f_key.name
+            _set_private_file_permissions(temp_key_path)
 
             try:
-                ctx.load_cert_chain(certfile=temp_cert_path, keyfile=self.leaf_key_path)
+                ctx.load_cert_chain(certfile=temp_cert_path, keyfile=temp_key_path)
             finally:
-                try:
-                    os.remove(temp_cert_path)
-                except OSError:
-                    pass
+                for p in (temp_cert_path, temp_key_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
             if len(self._leaf_cache) >= 2000:
                 oldest_key = next(iter(self._leaf_cache))
@@ -455,16 +441,32 @@ def install_system_ca(ca_cert_path: str) -> tuple[bool, str]:
     return False, "Unsupported platform for automatic OS CA installation. Please import ~/.ja4proxy/ca.pem manually."
 
 
-def uninstall_system_ca() -> tuple[bool, str]:
+def uninstall_system_ca(ca_cert_path: str | None = None) -> tuple[bool, str]:
     """
     Uninstalls the ja4proxy Root CA from the operating system certificate trust store.
     """
+    common_name = "ja4proxy Root CA"
+    if not ca_cert_path:
+        default_p = os.path.join(os.path.expanduser("~"), ".ja4proxy", "ca.pem")
+        if os.path.exists(default_p):
+            ca_cert_path = default_p
+
+    if ca_cert_path and os.path.exists(ca_cert_path):
+        try:
+            with open(ca_cert_path, "rb") as f:
+                cert = x509.load_pem_x509_certificate(f.read())
+            cns = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            if cns:
+                common_name = str(cns[0].value)
+        except Exception:
+            pass
+
     if os.name == "nt":
-        cmd = ["certutil", "-user", "-delstore", "Root", "ja4proxy Root CA"]
+        cmd = ["certutil", "-user", "-delstore", "Root", common_name]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if res.returncode == 0:
-                return True, "Removed ja4proxy Root CA from Windows Certificate Store."
+                return True, f"Removed '{common_name}' from Windows Certificate Store."
             return False, f"Windows certutil delstore failed: {res.stderr or res.stdout}"
         except Exception as e:
             return False, f"Windows certutil delstore failed: {e}"
@@ -485,25 +487,25 @@ def uninstall_system_ca() -> tuple[bool, str]:
                 return False, f"Failed removing {dest}: {e}"
 
     if removed:
-        return True, "Removed ja4proxy Root CA from Linux system trust store."
+        return True, f"Removed '{common_name}' from Linux system trust store."
 
     if os.path.exists("/Library/Keychains/System.keychain"):
         cmd = [
             "security",
             "delete-certificate",
             "-c",
-            "ja4proxy Root CA",
+            common_name,
             "/Library/Keychains/System.keychain",
         ]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0:
-                return True, "Removed ja4proxy Root CA from macOS System Keychain."
+                return True, f"Removed '{common_name}' from macOS System Keychain."
             return False, f"macOS security delete-certificate failed: {res.stderr or res.stdout}"
         except Exception as e:
             return False, f"macOS Keychain uninstallation failed: {e}"
 
-    return False, "ja4proxy Root CA was not found in system trust stores."
+    return False, f"'{common_name}' was not found in system trust stores."
 
 
 def install_ca(ca_cert_path: str | None = None) -> list[str]:
@@ -528,12 +530,12 @@ def install_ca(ca_cert_path: str | None = None) -> list[str]:
     return messages
 
 
-def uninstall_ca() -> list[str]:
+def uninstall_ca(ca_cert_path: str | None = None) -> list[str]:
     """
     Uninstalls the ja4proxy Root CA from both OS and Python certifi trust stores.
     """
     messages = []
-    ok_sys, msg_sys = uninstall_system_ca()
+    ok_sys, msg_sys = uninstall_system_ca(ca_cert_path=ca_cert_path)
     prefix_sys = "[+]" if ok_sys else "[-]"
     messages.append(f"{prefix_sys} System Store: {msg_sys}")
 
@@ -562,6 +564,19 @@ def inject_trust(cert_dir: str | None = None) -> str:
     Configures environment variables, requests adapters, and native truststore if present.
     Returns the path to the active combined CA bundle.
     """
+    try:
+        import certifi  # noqa: F401
+    except ImportError:
+        import warnings
+
+        warnings.warn(
+            "certifi is not installed in this environment. The combined CA bundle contains only "
+            "the ja4proxy root certificate. Direct, non-proxied HTTPS connections in this process "
+            "may fail SSL verification. Install certifi (`pip install certifi`) to retain public Mozilla trust.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     bundle_path = get_ca_bundle_path(cert_dir=cert_dir)
     ca_path = get_ca_cert_path(cert_dir=cert_dir)
 
