@@ -424,6 +424,8 @@ class ProxyServer:
             loop = asyncio.get_running_loop()
             transport = writer.transport
             protocol = transport.get_protocol()
+            if hasattr(protocol, "_over_ssl"):
+                protocol._over_ssl = True
             try:
                 new_transport = await asyncio.wait_for(
                     loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
@@ -508,6 +510,8 @@ class ProxyServer:
             loop = asyncio.get_running_loop()
             transport = writer.transport
             protocol = transport.get_protocol()
+            if hasattr(protocol, "_over_ssl"):
+                protocol._over_ssl = True
             try:
                 new_transport = await asyncio.wait_for(
                     loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
