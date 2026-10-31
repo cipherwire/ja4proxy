@@ -133,8 +133,8 @@ Any Existing Client Application
 ### 1. Single-Port Protocol Sniffing
 `ja4proxy` binds to a single port and inspects the initial byte stream using non-destructive socket inspection:
 * Byte `0x05`: Dispatches to the binary SOCKS5 state machine (RFC 1928), negotiating `NO AUTH` or `USERNAME/PASSWORD` before taking target host and port.
-* ASCII `CONNECT`: Intercepts HTTPS tunnels, performs an SSL handshake using dynamic per-hostname leaf certificates signed on-the-fly by the local CA, and decrypts request bytes.
-* ASCII `GET / POST / HEAD`: Handles standard forward proxy requests or gateway URLs (`http://127.0.0.1:8888/https://example.com`).
+* ASCII `CONNECT`: Intercepts HTTPS tunnels on port 443, performing an SSL handshake using dynamic per-hostname leaf certificates signed on-the-fly by the local CA. TLS traffic to any other port is relayed as a standards-compliant blind tunnel (RFC 9110) with the real upstream certificate, while cleartext HTTP on those ports still flows through the impersonation engine.
+* ASCII `GET / POST / HEAD`: Handles standard forward proxy requests or gateway URLs (`http://127.0.0.1:8888/https://example.com`). The `Host` header is always rewritten to the upstream target authority.
 
 ### 2. Zero-GIL Native C-Shared FFI
 Python manages client I/O asynchronously via `asyncio`. When dispatching outbound HTTP/TLS requests, `ja4proxy` calls into `libutls` through `ctypes`. The Python Global Interpreter Lock (GIL) is released during socket creation, cryptographic handshakes, and body streaming.
@@ -248,6 +248,10 @@ __/ /\__,_/  /_/ / .___/_/   \____/_/|_|\__, /
 ```
 
 ### 2. Configuration Options
+
+> **Windows note**: the `curl.exe` shipped with Windows uses the Schannel TLS backend,
+> which enforces CRL revocation checks that locally generated CAs cannot satisfy. Add
+> `--ssl-no-revoke` to curl commands using `--cacert`, or use a curl built against OpenSSL.
 
 ja4proxy can be configured via CLI flags or equivalent environment variables:
 
@@ -684,13 +688,15 @@ certutil -addstore -f "Root" "$env:TEMP\ja4proxy-ca.crt"
 ## Security & Engineering Boundaries
 
 1. **Pre-Flight SSRF Protection**:
-   `ja4proxy` resolves hostnames prior to outbound dispatch and drops requests resolving to private address spaces (RFC 1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback (`127.0.0.0/8`, `::1`), and cloud metadata (`169.254.169.254`). Internal forwarding can be enabled with `--allow-private-networks`.
+   `ja4proxy` resolves hostnames prior to outbound dispatch and drops requests resolving to private address spaces (RFC 1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback (`127.0.0.0/8`, `::1`), and cloud metadata (`169.254.169.254`). The same guard applies to client-supplied upstream proxies (`X-JA4-Upstream-Proxy` header or `proxy_` credential tag); the operator's own `--upstream-proxy` is trusted. Internal forwarding can be enabled with `--allow-private-networks`.
+
+   > **Known limitation**: because the guard resolves DNS at check time and the Go engine resolves again at dial time, DNS rebinding (a hostname alternating between public and private A records) is a theoretical bypass. Full mitigation requires engine-level IP pinning.
 
 2. **Decompression & Content-Length Sync**:
    The native Go engine decodes gzip/brotli/deflate responses transparently. `ja4proxy` strips stale `Content-Encoding` and `Transfer-Encoding` headers and recalculates accurate `Content-Length` before serving downstream, preventing double-decompression exceptions.
 
 3. **Header Sanitization**:
-   Incoming client hop-by-hop headers (`Proxy-Connection`, `Keep-Alive`, `Te`) and automated OpenSSL/Python identifiers are stripped. Canonical browser headers (`User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`) matching the selected profile are automatically synthesized when missing.
+   Incoming client hop-by-hop headers (`Proxy-Connection`, `Keep-Alive`, `Te`) and proxy directive headers are stripped. Well-known automation `User-Agent` values (curl, python-requests, Go http client, etc.) are replaced with the canonical browser `User-Agent` of the active profile, so the HTTP layer stays consistent with the impersonated TLS fingerprint; explicitly configured custom user agents are preserved. Canonical browser headers (`User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`) matching the selected profile are automatically synthesized when missing.
 
 4. **Zero-GIL Execution**:
    Native C FFI functions execute outside Python's GIL. Concurrency scales across available CPU cores and network threads without interpreter bottlenecks.
@@ -738,7 +744,7 @@ Run the full automated test suite covering CA generation, SOCKS5 state machines,
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-All 19 unit and live tests execute with zero warnings and zero regressions:
+All 29 unit and live tests execute with zero warnings and zero regressions:
 ```text
 test_ca_creation (test_certs.TestCertificateAuthority) ... ok
 test_leaf_cert_generation (test_certs.TestCertificateAuthority) ... ok
@@ -759,9 +765,10 @@ test_extract_directives_priority_header_over_auth (test_parser.TestParser) ... o
 test_parse_credentials_empty (test_parser.TestParser) ... ok
 test_parse_credentials_proxy_with_hyphens (test_parser.TestParser) ... ok
 test_parse_credentials_tags (test_parser.TestParser) ... ok
+...
 
 ----------------------------------------------------------------------
-Ran 19 tests in 6.421s
+Ran 29 tests in ~6s
 
 OK
 ```

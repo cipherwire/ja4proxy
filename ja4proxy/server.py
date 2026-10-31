@@ -51,6 +51,15 @@ def extract_host_port(authority: str, default_port: int = 80) -> tuple[str, int]
     return h, default_port
 
 
+def _with_target_host(headers: dict[str, str], authority: str) -> dict[str, str]:
+    """Forces the Host header to the upstream target authority. Gateway-mode clients
+    send the proxy's own authority in Host, which would misroute vhost-based
+    upstreams; CONNECT clients may omit or spoof it."""
+    cleaned = {k: v for k, v in headers.items() if k.lower() != "host"}
+    cleaned["Host"] = authority
+    return cleaned
+
+
 def is_ip_restricted(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Checks if an IP belongs to private, loopback, link-local, multicast, or reserved ranges."""
     if (
@@ -105,10 +114,14 @@ async def is_ssrf_restricted(
         if now < expiry:
             return is_restricted
 
-    # Singleflight in-flight deduplication
-    if clean_lower not in _DNS_LOCKS:
-        _DNS_LOCKS[clean_lower] = asyncio.Lock()
-    lock = _DNS_LOCKS[clean_lower]
+    # Singleflight in-flight deduplication (lock map is bounded; in-flight waiters
+    # keep their own reference so eviction is safe)
+    lock = _DNS_LOCKS.get(clean_lower)
+    if lock is None:
+        if len(_DNS_LOCKS) >= 5000:
+            oldest = next(iter(_DNS_LOCKS))
+            _DNS_LOCKS.pop(oldest, None)
+        lock = _DNS_LOCKS.setdefault(clean_lower, asyncio.Lock())
 
     async with lock:
         now = time.monotonic()
@@ -137,7 +150,9 @@ async def is_ssrf_restricted(
 
             _DNS_CACHE[clean_lower] = (is_restricted, now + _DNS_CACHE_TTL)
             return is_restricted
-        except (socket.gaierror, OSError):
+        except (socket.gaierror, OSError, UnicodeError, ValueError):
+            # Unresolvable or DNS-invalid names (e.g. labels over 63 chars) are not
+            # privately routable; let the outbound dial fail naturally (-> 502).
             pass
 
     return False
@@ -325,92 +340,121 @@ class ProxyServer:
 
         return headers, body
 
+    async def _socks5_negotiate(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> tuple[Directive, str, int] | None:
+        """RFC 1928 negotiation (auth + request target). All fixed-length fields use
+        readexactly so TCP segmentation cannot truncate the SOCKS5 stream. Returns
+        (directive, host, port) on success or None after writing the error reply."""
+        try:
+            # 1. Read authentication methods
+            nmethods = (await reader.readexactly(1))[0]
+            if nmethods == 0:
+                writer.write(b"\x05\xFF")  # No acceptable authentication methods
+                await writer.drain()
+                return None
+            methods = await reader.readexactly(nmethods)
+
+            directive = Directive()
+            if self.auth:
+                if b"\x02" not in methods:
+                    writer.write(b"\x05\xFF")  # No acceptable authentication methods
+                    await writer.drain()
+                    return None
+
+                writer.write(b"\x05\x02")  # Require username/password
+                await writer.drain()
+
+                ver = await reader.readexactly(1)
+                if ver != b"\x01":
+                    return None
+                ulen = (await reader.readexactly(1))[0]
+                uname = (await reader.readexactly(ulen)).decode("utf-8", errors="replace")
+                plen = (await reader.readexactly(1))[0]
+                password = (await reader.readexactly(plen)).decode("utf-8", errors="replace")
+
+                if not self._check_auth(uname, password):
+                    writer.write(b"\x01\x01")  # Authentication failure
+                    await writer.drain()
+                    return None
+
+                directive = parse_credentials(uname)
+                writer.write(b"\x01\x00")  # Authentication success
+                await writer.drain()
+            else:
+                if b"\x02" in methods:
+                    writer.write(b"\x05\x02")
+                    await writer.drain()
+
+                    ver = await reader.readexactly(1)
+                    if ver != b"\x01":
+                        return None
+                    ulen = (await reader.readexactly(1))[0]
+                    uname = (await reader.readexactly(ulen)).decode("utf-8", errors="replace")
+                    plen = (await reader.readexactly(1))[0]
+                    await reader.readexactly(plen)
+
+                    directive = parse_credentials(uname)
+                    writer.write(b"\x01\x00")
+                    await writer.drain()
+                else:
+                    writer.write(b"\x05\x00")
+                    await writer.drain()
+
+            # 2. Read SOCKS5 request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT
+            req_hdr = await reader.readexactly(4)
+            if req_hdr[0] != 5 or req_hdr[1] != 1:  # CMD 1 = CONNECT
+                writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")  # Command not supported
+                await writer.drain()
+                return None
+
+            atyp = req_hdr[3]
+            target_host = ""
+            if atyp == 1:  # IPv4
+                target_host = str(ipaddress.IPv4Address(await reader.readexactly(4)))
+            elif atyp == 3:  # Domain name
+                domain_len = (await reader.readexactly(1))[0]
+                target_host = (await reader.readexactly(domain_len)).decode("utf-8", errors="replace")
+            elif atyp == 4:  # IPv6
+                target_host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
+            else:
+                writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                return None
+
+            target_port = struct.unpack("!H", await reader.readexactly(2))[0]
+        except asyncio.IncompleteReadError:
+            return None  # client vanished mid-negotiation
+        return directive, target_host, target_port
+
     async def _handle_socks5(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Handles binary SOCKS5 negotiation (RFC 1928) with directive extraction and authentication."""
-        # 1. Read authentication methods
-        nmethods_byte = await reader.read(1)
-        if not nmethods_byte:
+        try:
+            negotiated = await asyncio.wait_for(
+                self._socks5_negotiate(reader, writer),
+                timeout=self.tls_handshake_timeout,
+            )
+        except asyncio.TimeoutError:
+            return  # stall during negotiation: drop the connection
+        if negotiated is None:
             return
-        nmethods = nmethods_byte[0]
-        methods = await reader.read(nmethods)
-
-        directive = Directive()
-        if self.auth:
-            if b"\x02" not in methods:
-                writer.write(b"\x05\xFF")  # No acceptable authentication methods
-                await writer.drain()
-                return
-
-            writer.write(b"\x05\x02")  # Require username/password
-            await writer.drain()
-
-            ver = await reader.read(1)
-            if ver != b"\x01":
-                return
-            ulen = (await reader.read(1))[0]
-            uname = (await reader.read(ulen)).decode("utf-8", errors="replace")
-            plen = (await reader.read(1))[0]
-            password = (await reader.read(plen)).decode("utf-8", errors="replace")
-
-            if not self._check_auth(uname, password):
-                writer.write(b"\x01\x01")  # Authentication failure
-                await writer.drain()
-                return
-
-            directive = parse_credentials(uname)
-            writer.write(b"\x01\x00")  # Authentication success
-            await writer.drain()
-        else:
-            if b"\x02" in methods:
-                writer.write(b"\x05\x02")
-                await writer.drain()
-
-                ver = await reader.read(1)
-                if ver != b"\x01":
-                    return
-                ulen = (await reader.read(1))[0]
-                uname = (await reader.read(ulen)).decode("utf-8", errors="replace")
-                plen = (await reader.read(1))[0]
-                await reader.read(plen)
-
-                directive = parse_credentials(uname)
-                writer.write(b"\x01\x00")
-                await writer.drain()
-            else:
-                writer.write(b"\x05\x00")
-                await writer.drain()
-
-        # 2. Read SOCKS5 request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT
-        req_hdr = await reader.read(4)
-        if len(req_hdr) < 4 or req_hdr[0] != 5 or req_hdr[1] != 1:  # CMD 1 = CONNECT
-            writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")  # Command not supported
-            await writer.drain()
-            return
-
-        atyp = req_hdr[3]
-        target_host = ""
-        if atyp == 1:  # IPv4
-            ip_bytes = await reader.read(4)
-            target_host = str(ipaddress.IPv4Address(ip_bytes))
-        elif atyp == 3:  # Domain name
-            domain_len = (await reader.read(1))[0]
-            target_host = (await reader.read(domain_len)).decode("utf-8", errors="replace")
-        elif atyp == 4:  # IPv6
-            ip_bytes = await reader.read(16)
-            target_host = str(ipaddress.IPv6Address(ip_bytes))
-        else:
-            writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            return
-
-        port_bytes = await reader.read(2)
-        target_port = struct.unpack("!H", port_bytes)[0]
+        directive, target_host, target_port = negotiated
         target_authority = f"{target_host}:{target_port}"
 
         # Asynchronous SSRF Protection
         if not self.allow_private_networks and await is_ssrf_restricted(target_host):
+            writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # Connection not allowed
+            await writer.drain()
+            return
+
+        # Client-supplied upstream proxies are dialed by the engine: guard them too
+        if (
+            directive.upstream_proxy
+            and directive.upstream_proxy != self.upstream_proxy
+            and not await self._validate_upstream_proxy(directive.upstream_proxy)
+        ):
             writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")  # Connection not allowed
             await writer.drain()
             return
@@ -420,34 +464,14 @@ class ProxyServer:
             ssl_ctx = await self.ca.get_ssl_context_for_host_async(target_host)
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
-
-            loop = asyncio.get_running_loop()
-            transport = writer.transport
-            protocol = transport.get_protocol()
-            if hasattr(protocol, "_over_ssl"):
-                protocol._over_ssl = True
-            try:
-                new_transport = await asyncio.wait_for(
-                    loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
-                    timeout=self.tls_handshake_timeout,
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.debug(f"SOCKS5 TLS handshake failed or timed out for {target_host}: {exc}")
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-                return
-            writer._transport = new_transport
-
-            try:
-                await self._run_tls_http_loop(reader, writer, target_authority, directive)
-            finally:
-                writer.close()
+            await self._run_tls_tunnel(reader, writer, target_authority, directive, ssl_ctx)
         else:
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
+            if await self._sniff_tls_client_hello(reader):
+                # TLS on a non-standard port: RFC 1928 CONNECT must be a blind tunnel
+                await self._blind_tunnel(reader, writer, target_host, target_port)
+                return
             try:
                 await self._run_plain_http_loop(reader, writer, target_authority, directive)
             finally:
@@ -493,6 +517,10 @@ class ProxyServer:
                 return
 
         clean_host, target_port = extract_host_port(target_authority, default_port=443)
+        if not clean_host:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\nMissing target host")
+            await writer.drain()
+            return
 
         # Asynchronous SSRF Protection
         if not self.allow_private_networks and await is_ssrf_restricted(clean_host):
@@ -502,42 +530,156 @@ class ProxyServer:
 
         directive, _ = extract_directives(headers)
 
+        # Client-supplied upstream proxies are dialed by the engine: guard them too
+        if (
+            directive.upstream_proxy
+            and directive.upstream_proxy != self.upstream_proxy
+            and not await self._validate_upstream_proxy(directive.upstream_proxy)
+        ):
+            writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\nRestricted upstream proxy address")
+            await writer.drain()
+            return
+
         if target_port == 443:
             ssl_ctx = await self.ca.get_ssl_context_for_host_async(clean_host)
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
-
-            loop = asyncio.get_running_loop()
-            transport = writer.transport
-            protocol = transport.get_protocol()
-            if hasattr(protocol, "_over_ssl"):
-                protocol._over_ssl = True
-            try:
-                new_transport = await asyncio.wait_for(
-                    loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
-                    timeout=self.tls_handshake_timeout,
-                )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.debug(f"CONNECT TLS handshake failed or timed out for {clean_host}: {exc}")
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-                return
-            writer._transport = new_transport
-
-            try:
-                await self._run_tls_http_loop(reader, writer, target_authority, directive)
-            finally:
-                writer.close()
+            await self._run_tls_tunnel(reader, writer, target_authority, directive, ssl_ctx)
         else:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
+            if await self._sniff_tls_client_hello(reader):
+                # RFC 9110: CONNECT traffic on non-intercepted ports is a blind tunnel
+                await self._blind_tunnel(reader, writer, clean_host, target_port)
+                return
             try:
                 await self._run_plain_http_loop(reader, writer, target_authority, directive)
             finally:
                 writer.close()
+
+    async def _sniff_tls_client_hello(self, reader: asyncio.StreamReader) -> bool:
+        """
+        Non-destructively checks whether the incoming byte stream starts with a TLS
+        handshake record (0x16). Peeks at the reader buffer without consuming, so a
+        detected ClientHello stays intact for the downstream handler. Falls back to
+        False (cleartext) when the reader cannot be inspected or stays silent until
+        the idle timeout.
+        """
+        buf = getattr(reader, "_buffer", None)
+        if buf is None:
+            return False
+        if not buf:
+            try:
+                await asyncio.wait_for(
+                    reader._wait_for_data("ja4proxy_sniff"), timeout=self.idle_timeout
+                )
+            except asyncio.TimeoutError:
+                return False
+        return bool(buf) and buf[0] == 0x16
+
+    async def _blind_tunnel(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+    ) -> None:
+        """Relays raw bytes verbatim between client and target (RFC 9110 CONNECT /
+        SOCKS5 semantics) for TLS traffic on non-intercepted ports. The caller has
+        already validated the target against the SSRF guard and sent the success
+        reply. Bytes buffered during sniffing (e.g. the ClientHello) are flushed
+        first so the tunnel stays byte-exact."""
+        try:
+            up_reader, up_writer = await asyncio.open_connection(host, port)
+        except OSError as exc:
+            logger.debug(f"Blind tunnel connection to {host}:{port} failed: {exc}")
+            writer.close()
+            return
+
+        async def _pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+            try:
+                while True:
+                    data = await src.read(65536)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+                pass
+
+        try:
+            buffered = await reader.read(65536)
+            if buffered:
+                up_writer.write(buffered)
+                await up_writer.drain()
+
+            to_target = asyncio.create_task(_pump(reader, up_writer))
+            to_client = asyncio.create_task(_pump(up_reader, writer))
+            try:
+                _, pending = await asyncio.wait(
+                    {to_target, to_client}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            except asyncio.CancelledError:
+                to_target.cancel()
+                to_client.cancel()
+                raise
+        finally:
+            writer.close()
+            up_writer.close()
+
+    async def _run_tls_tunnel(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        target_authority: str,
+        directive: Directive,
+        ssl_ctx: ssl.SSLContext,
+    ) -> None:
+        """Upgrades the established connection to server-side TLS and serves the
+        intercepted HTTP loop. The caller must have prepared the leaf SSL context
+        and already sent the protocol success reply (CONNECT 200 / SOCKS5 success)."""
+        loop = asyncio.get_running_loop()
+        transport = writer.transport
+        protocol = transport.get_protocol()
+        if hasattr(protocol, "_over_ssl"):
+            protocol._over_ssl = True
+        try:
+            new_transport = await asyncio.wait_for(
+                loop.start_tls(transport, protocol, ssl_ctx, server_side=True),
+                timeout=self.tls_handshake_timeout,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.debug(f"TLS handshake failed or timed out for {target_authority}: {exc}")
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+        writer._transport = new_transport
+
+        try:
+            await self._run_tls_http_loop(reader, writer, target_authority, directive)
+        finally:
+            writer.close()
+
+    async def _validate_upstream_proxy(self, proxy_url: str) -> bool:
+        """Client-supplied upstream proxy URLs must pass the SSRF guard before the
+        engine dials them. The server operator's own --upstream-proxy configuration
+        is trusted."""
+        if self.allow_private_networks:
+            return True
+        try:
+            parsed = urllib.parse.urlparse(proxy_url)
+        except ValueError:
+            return False
+        host = parsed.hostname or ""
+        if not host:
+            return False
+        return not await is_ssrf_restricted(host)
 
     async def _run_tls_http_loop(
         self,
@@ -575,6 +717,7 @@ class ProxyServer:
                 target_url = f"https://{target_authority}{path}"
 
                 req_directive, clean_headers = extract_directives(headers)
+                clean_headers = _with_target_host(clean_headers, target_authority)
 
                 # Directive priority: per-request header > initial auth directive > server default
                 profile_to_use = (
@@ -609,6 +752,22 @@ class ProxyServer:
 
                 if session_to_use != "ja4_default":
                     used_sessions.add(session_to_use)
+
+                # Client-supplied upstream proxies are dialed by the engine: guard them too
+                if (
+                    proxy_to_use
+                    and proxy_to_use != self.upstream_proxy
+                    and not await self._validate_upstream_proxy(proxy_to_use)
+                ):
+                    await self._write_response(
+                        writer,
+                        {
+                            "status": 403,
+                            "headers": {"Content-Type": "text/plain; charset=utf-8"},
+                            "body": b"Restricted upstream proxy address",
+                        },
+                    )
+                    break
 
                 upstream_resp = await self.engine.request(
                     method=method,
@@ -675,6 +834,7 @@ class ProxyServer:
                 target_url = f"http://{target_authority}{path}"
 
                 req_directive, clean_headers = extract_directives(headers)
+                clean_headers = _with_target_host(clean_headers, target_authority)
                 profile_to_use = (
                     req_directive.profile
                     or directive.profile
@@ -707,6 +867,22 @@ class ProxyServer:
 
                 if session_to_use != "ja4_default":
                     used_sessions.add(session_to_use)
+
+                # Client-supplied upstream proxies are dialed by the engine: guard them too
+                if (
+                    proxy_to_use
+                    and proxy_to_use != self.upstream_proxy
+                    and not await self._validate_upstream_proxy(proxy_to_use)
+                ):
+                    await self._write_response(
+                        writer,
+                        {
+                            "status": 403,
+                            "headers": {"Content-Type": "text/plain; charset=utf-8"},
+                            "body": b"Restricted upstream proxy address",
+                        },
+                    )
+                    break
 
                 upstream_resp = await self.engine.request(
                     method=method,
@@ -780,6 +956,10 @@ class ProxyServer:
 
         parsed = urllib.parse.urlparse(target_url)
         clean_host = parsed.hostname or ""
+        if not clean_host:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\nMissing target host")
+            await writer.drain()
+            return
 
         # Asynchronous SSRF Protection
         if not self.allow_private_networks and await is_ssrf_restricted(clean_host):
@@ -788,10 +968,21 @@ class ProxyServer:
             return
 
         directive, clean_headers = extract_directives(headers)
+        clean_headers = _with_target_host(clean_headers, parsed.netloc)
         profile_to_use = directive.profile or self.default_profile
         proxy_to_use = directive.upstream_proxy or self.upstream_proxy or ""
         session_to_use = directive.session_id or "ja4_default"
         timeout_to_use = directive.timeout if directive.timeout is not None else 30
+
+        # Client-supplied upstream proxies are dialed by the engine: guard them too
+        if (
+            proxy_to_use
+            and proxy_to_use != self.upstream_proxy
+            and not await self._validate_upstream_proxy(proxy_to_use)
+        ):
+            writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\nRestricted upstream proxy address")
+            await writer.drain()
+            return
 
         upstream_resp = await self.engine.request(
             method=method,

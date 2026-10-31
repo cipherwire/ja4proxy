@@ -2,6 +2,7 @@ import asyncio
 import base64
 import ctypes
 import json
+import re
 import threading
 from typing import Any
 
@@ -10,6 +11,27 @@ from ja4proxy.profiles import (
     get_canonical_header_order,
     get_default_headers,
     normalize_profile,
+)
+
+# Well-known automation client signatures. When a client supplies one of these as
+# User-Agent the canonical profile header replaces it, keeping the HTTP layer
+# consistent with the impersonated TLS fingerprint (README: Header Sanitization).
+_AUTOMATION_UA_PREFIXES = (
+    "curl/",
+    "wget/",
+    "python-requests/",
+    "python-urllib/",
+    "python-httpx",
+    "aiohttp/",
+    "go-http-client",
+    "java/",
+    "apache-httpclient",
+    "okhttp/",
+    "scrapy",
+    "libwww-perl",
+    "axios/",
+    "undici",
+    "node-fetch",
 )
 
 
@@ -37,6 +59,23 @@ class NativeEngine:
         self.lib.destroySession.argtypes = [ctypes.c_char_p]
         self.lib.destroySession.restype = ctypes.c_char_p
 
+        # The Go library bakes the TLS profile and verification mode into the client
+        # it caches per session id, so every (session, profile, insecure) combination
+        # maps to a distinct native session key. Aliases let destroy_session() tear
+        # down every native session a logical session id created.
+        self._alias_lock = threading.Lock()
+        self._session_aliases: dict[str, set[str]] = {}
+
+    @staticmethod
+    def effective_session_id(session_id: str, profile: str, insecure_skip_verify: bool) -> str:
+        """Native session key for a logical session under a specific TLS profile."""
+        suffix = f"{profile}|insecure" if insecure_skip_verify else profile
+        return f"{session_id}|{suffix}"
+
+    def _register_alias(self, client_id: str, effective_id: str) -> None:
+        with self._alias_lock:
+            self._session_aliases.setdefault(client_id, set()).add(effective_id)
+
     @classmethod
     def get_instance(cls) -> "NativeEngine":
         if cls._instance is None:
@@ -57,12 +96,21 @@ class NativeEngine:
         try:
             raw_bytes = ctypes.string_at(resp_ptr)
             decoded = raw_bytes.decode("utf-8", errors="replace")
-            resp_obj = json.loads(decoded)
+            try:
+                resp_obj = json.loads(decoded)
+            except Exception:
+                resp_obj = None
             if isinstance(resp_obj, dict):
                 resp_id = resp_obj.get("id")
+            else:
+                # Recover the allocation id even when the payload is not valid JSON
+                # so the Go-side buffer can still be released.
+                m = re.search(rb'"id"\s*:\s*"([^"]+)"', raw_bytes)
+                if m:
+                    resp_id = m.group(1).decode("ascii", errors="ignore")
+            if resp_obj is None:
+                raise EngineError(f"Failed to parse native engine response: {decoded[:200]}")
             return resp_obj
-        except Exception as e:
-            raise EngineError(f"Failed to parse native engine response: {e}") from e
         finally:
             if resp_id:
                 try:
@@ -76,28 +124,37 @@ class NativeEngine:
         return await loop.run_in_executor(None, self._execute_sync, payload)
 
     def destroy_session_sync(self, session_id: str) -> bool:
-        """Destroys an allocated session in the Go engine to release memory and cookies."""
-        payload = json.dumps({"sessionId": session_id}).encode("utf-8")
-        resp_ptr = self.lib.destroySession(payload)
-        if not resp_ptr:
-            return False
+        """Destroys every native session allocated for a logical session id."""
+        with self._alias_lock:
+            targets = self._session_aliases.pop(session_id, None)
+        targets = targets or {session_id}
 
-        resp_id = None
-        try:
-            raw_bytes = ctypes.string_at(resp_ptr)
-            resp_obj = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-            if isinstance(resp_obj, dict):
-                resp_id = resp_obj.get("id")
-                return bool(resp_obj.get("success", False))
-            return False
-        except Exception:
-            return False
-        finally:
-            if resp_id:
-                try:
-                    self.lib.freeMemory(resp_id.encode("utf-8"))
-                except Exception:
-                    pass
+        all_ok = True
+        for target in targets:
+            payload = json.dumps({"sessionId": target}).encode("utf-8")
+            resp_ptr = self.lib.destroySession(payload)
+            if not resp_ptr:
+                all_ok = False
+                continue
+
+            resp_id = None
+            try:
+                raw_bytes = ctypes.string_at(resp_ptr)
+                resp_obj = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+                if isinstance(resp_obj, dict):
+                    resp_id = resp_obj.get("id")
+                    all_ok = all_ok and bool(resp_obj.get("success", False))
+                else:
+                    all_ok = False
+            except Exception:
+                all_ok = False
+            finally:
+                if resp_id:
+                    try:
+                        self.lib.freeMemory(resp_id.encode("utf-8"))
+                    except Exception:
+                        pass
+        return all_ok
 
     async def destroy_session(self, session_id: str) -> bool:
         loop = asyncio.get_running_loop()
@@ -127,6 +184,12 @@ class NativeEngine:
             encoded_body = base64.b64encode(body).decode("utf-8")
             is_byte_req = True
 
+        # The Go engine bakes the TLS profile and verification mode into the client
+        # cached per session id, so a logical session must key its native sessions by
+        # (profile, insecure) or profile switches would be silently ignored.
+        effective_session = self.effective_session_id(session_id, prof, insecure_skip_verify)
+        self._register_alias(session_id, effective_session)
+
         # Start with default browser headers for the profile
         merged_headers: dict[str, str] = get_default_headers(prof)
 
@@ -136,10 +199,18 @@ class NativeEngine:
                 if v is not None:
                     merged_headers[k.lower()] = str(v)
 
+        # Strip well-known automation User-Agents so the HTTP layer stays consistent
+        # with the impersonated TLS fingerprint; explicit custom browser UAs pass through.
+        ua = merged_headers.get("user-agent", "")
+        if ua.strip().lower().startswith(_AUTOMATION_UA_PREFIXES):
+            default_ua = get_default_headers(prof).get("user-agent")
+            if default_ua:
+                merged_headers["user-agent"] = default_ua
+
         header_order = get_canonical_header_order(prof, merged_headers)
 
         payload = {
-            "sessionId": session_id,
+            "sessionId": effective_session,
             "tlsClientIdentifier": prof,
             "requestMethod": method.upper(),
             "requestUrl": url,
@@ -164,6 +235,8 @@ class NativeEngine:
         status_code = raw.get("status", 0)
         raw_headers = raw.get("headers") or {}
         used_protocol = raw.get("usedProtocol", "")
+        if used_protocol.startswith("HTTP/2"):
+            used_protocol = "h2"
         raw_body = raw.get("body", "")
 
         # Handle native engine failure (status 0) -> 502 Bad Gateway

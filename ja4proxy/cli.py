@@ -194,6 +194,12 @@ def start(
         asyncio.run(server.serve_forever())
     except KeyboardInterrupt:
         click.echo(click.style("\n[*] Shutting down ja4proxy...", fg="yellow"))
+    except OSError as e:
+        click.echo(
+            click.style(f"[-] Failed to start server on {host}:{port}: {e}", fg="red", bold=True),
+            err=True,
+        )
+        sys.exit(1)
 
 
 @main.command(name="profiles")
@@ -206,6 +212,7 @@ def list_profiles() -> None:
     chrome_profs = [p for p in SUPPORTED_PROFILES if p.startswith("chrome")]
     safari_profs = [p for p in SUPPORTED_PROFILES if p.startswith("safari")]
     firefox_profs = [p for p in SUPPORTED_PROFILES if p.startswith("firefox")]
+    opera_profs = [p for p in SUPPORTED_PROFILES if p.startswith("opera")]
 
     click.echo(click.style("  Google Chrome / Chromium:", fg="cyan", bold=True))
     for p in chrome_profs:
@@ -220,6 +227,11 @@ def list_profiles() -> None:
     click.echo("")
     click.echo(click.style("  Mozilla Firefox:", fg="cyan", bold=True))
     for p in firefox_profs:
+        click.echo(f"    - {p}")
+
+    click.echo("")
+    click.echo(click.style("  Opera (Chromium):", fg="cyan", bold=True))
+    for p in opera_profs:
         click.echo(f"    - {p}")
     click.echo("")
 
@@ -285,7 +297,14 @@ def manage_ca(
 
     if export_path:
         dest = os.path.abspath(export_path)
-        shutil.copyfile(ca.ca_cert_path, dest)
+        try:
+            shutil.copyfile(ca.ca_cert_path, dest)
+        except OSError as e:
+            click.echo(
+                click.style(f"[-] Failed to export CA to {dest}: {e}", fg="red", bold=True),
+                err=True,
+            )
+            sys.exit(1)
         click.echo(click.style(f"[+] Successfully exported CA to: {dest}", fg="green", bold=True))
     else:
         click.echo(click.style(" Trust Store Commands:", fg="bright_white", bold=True))

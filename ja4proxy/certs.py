@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import ipaddress
+import logging
 import os
 import shutil
 import ssl
@@ -13,6 +14,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+
+logger = logging.getLogger("ja4proxy")
 
 
 def _set_private_file_permissions(path: str) -> None:
@@ -80,15 +83,27 @@ class CertificateAuthority:
     def _ensure_ca(self) -> None:
         """Loads existing CA certificate/key or generates a fresh 10-year root CA."""
         if os.path.exists(self.ca_cert_path) and os.path.exists(self.ca_key_path):
-            with open(self.ca_key_path, "rb") as f:
-                self.ca_key = serialization.load_pem_private_key(
-                    f.read(), password=None
+            try:
+                with open(self.ca_key_path, "rb") as f:
+                    self.ca_key = serialization.load_pem_private_key(
+                        f.read(), password=None
+                    )
+                with open(self.ca_cert_path, "rb") as f:
+                    self.ca_cert = x509.load_pem_x509_certificate(f.read())
+            except Exception as e:
+                logger.warning(
+                    f"Existing CA files in {self.cert_dir} are unreadable/corrupted "
+                    f"({type(e).__name__}: {e}); regenerating a fresh Root CA."
                 )
-            with open(self.ca_cert_path, "rb") as f:
-                self.ca_cert = x509.load_pem_x509_certificate(f.read())
-            _set_private_file_permissions(self.ca_key_path)
-            self.build_combined_ca_bundle()
-            return
+                for stale in (self.ca_cert_path, self.ca_key_path, self.combined_ca_path):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+            else:
+                _set_private_file_permissions(self.ca_key_path)
+                self.build_combined_ca_bundle()
+                return
 
         # Generate fresh 2048-bit RSA key for CA
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -177,12 +192,19 @@ class CertificateAuthority:
             if clean_host in self._leaf_cache:
                 return self._leaf_cache[clean_host]
 
+            if not clean_host:
+                raise ValueError("host must not be empty")
+
             # Generate unique ephemeral 2048-bit RSA key for this host
             leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
+            # RFC 5280 caps CN at 64 characters; the SAN below carries the full
+            # identity, so a truncated CN is purely cosmetic for legacy clients.
+            cn_value = clean_host if len(clean_host) <= 64 else clean_host[:64]
+
             subject_name = x509.Name(
                 [
-                    x509.NameAttribute(NameOID.COMMON_NAME, clean_host),
+                    x509.NameAttribute(NameOID.COMMON_NAME, cn_value),
                 ]
             )
 
@@ -382,12 +404,22 @@ def install_system_ca(ca_cert_path: str) -> tuple[bool, str]:
         # Windows Current User Root Store
         cmd = ["certutil", "-user", "-addstore", "-f", "Root", ca_cert_path]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,  # first-time installs raise a consent dialog that waits for the user
+                stdin=subprocess.DEVNULL,
+            )
             if res.returncode == 0:
                 return True, "Added ja4proxy Root CA to Windows Certificate Store (Trusted Root Certification Authorities)."
             return False, f"Windows certutil command returned code {res.returncode}: {res.stderr or res.stdout}"
         except subprocess.TimeoutExpired:
-            return False, "Windows certutil prompted for desktop confirmation. Please run in an interactive terminal to click Yes."
+            return False, (
+                "Windows raised a certificate consent dialog that was not confirmed. "
+                "Re-run 'ja4proxy ca install' and accept the Windows security prompt, "
+                "or import ~/.ja4proxy/ca.pem manually via certutil."
+            )
         except Exception as e:
             return False, f"Windows certutil execution failed: {e}"
 
@@ -464,10 +496,20 @@ def uninstall_system_ca(ca_cert_path: str | None = None) -> tuple[bool, str]:
     if os.name == "nt":
         cmd = ["certutil", "-user", "-delstore", "Root", common_name]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            # certutil's Root-store delete confirmation blocks on stdin when it is an
+            # open pipe; DEVNULL makes it proceed non-interactively instead of hanging.
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
             if res.returncode == 0:
                 return True, f"Removed '{common_name}' from Windows Certificate Store."
             return False, f"Windows certutil delstore failed: {res.stderr or res.stdout}"
+        except subprocess.TimeoutExpired:
+            return False, "Windows certutil delstore timed out; remove the CA manually via certmgr.msc."
         except Exception as e:
             return False, f"Windows certutil delstore failed: {e}"
 
@@ -585,8 +627,6 @@ def inject_trust(cert_dir: str | None = None) -> str:
     os.environ["SSL_CERT_FILE"] = bundle_path
     os.environ["NODE_EXTRA_CA_CERTS"] = ca_path
 
-    if "requests.adapters" in sys.modules:
-        setattr(sys.modules["requests.adapters"], "DEFAULT_CA_BUNDLE_PATH", bundle_path)
     if "requests.utils" in sys.modules and hasattr(sys.modules["requests.utils"], "DEFAULT_CA_BUNDLE_PATH"):
         setattr(sys.modules["requests.utils"], "DEFAULT_CA_BUNDLE_PATH", bundle_path)
 
