@@ -27,6 +27,23 @@ def _set_private_file_permissions(path: str) -> None:
             pass
 
 
+def _default_ca_dir() -> str:
+    """Resolves the default CA directory. Under sudo, expanduser("~") points at
+    /root, which would make 'sudo ja4proxy ca install' trust a different Root CA
+    than the one the (non-root) server actually signs with; resolve the invoking
+    user's home instead."""
+    if os.name != "nt":
+        sudo_user = os.getenv("SUDO_USER")
+        if sudo_user:
+            try:
+                import pwd
+
+                return os.path.join(pwd.getpwnam(sudo_user).pw_dir, ".ja4proxy")
+            except (KeyError, ImportError):
+                pass
+    return os.path.join(os.path.expanduser("~"), ".ja4proxy")
+
+
 class CertificateAuthority:
     """Manages the local root CA and signs dynamic leaf certificates for HTTPS interception."""
 
@@ -34,7 +51,7 @@ class CertificateAuthority:
         if cert_dir:
             self.cert_dir = cert_dir
         else:
-            self.cert_dir = os.path.join(os.path.expanduser("~"), ".ja4proxy")
+            self.cert_dir = _default_ca_dir()
         os.makedirs(self.cert_dir, exist_ok=True)
 
         self.ca_cert_path = os.path.join(self.cert_dir, "ca.pem")
@@ -107,7 +124,7 @@ class CertificateAuthority:
 
         # Generate fresh 2048-bit RSA key for CA
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        default_dir = os.path.join(os.path.expanduser("~"), ".ja4proxy")
+        default_dir = _default_ca_dir()
         if os.path.abspath(self.cert_dir) != os.path.abspath(default_dir):
             import hashlib
 
@@ -479,7 +496,7 @@ def uninstall_system_ca(ca_cert_path: str | None = None) -> tuple[bool, str]:
     """
     common_name = "ja4proxy Root CA"
     if not ca_cert_path:
-        default_p = os.path.join(os.path.expanduser("~"), ".ja4proxy", "ca.pem")
+        default_p = os.path.join(_default_ca_dir(), "ca.pem")
         if os.path.exists(default_p):
             ca_cert_path = default_p
 
