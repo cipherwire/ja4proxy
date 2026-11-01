@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/cipherwire/ja4proxy/compare/v0.7.0...v0.7.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **ca:** resolve default CA dir via SUDO_USER so 'sudo ja4proxy ca install' trusts the CA the server actually signs with ([73d9f18](https://github.com/cipherwire/ja4proxy/commit/73d9f18f6c8ffb41d8775cc2056a04f43ce3fb74))
+* **proxy:** per-request profile switching, RFC-compliant CONNECT tunnels, Host rewrite, SSRF-guarded upstream proxies, and CA/CLI hardening ([9f6cb03](https://github.com/cipherwire/ja4proxy/commit/9f6cb030a6e24797a814c140deb4607c51706f03))
+* **server:** set protocol._over_ssl to prevent asyncio eof_received warning on TLS teardown ([c18d2e0](https://github.com/cipherwire/ja4proxy/commit/c18d2e0fa97a0e82237fddf54198984999dccbe6))
+
 ## [0.7.0](https://github.com/cipherwire/ja4proxy/compare/v0.6.0...v0.7.0) (2026-10-28)
 
 
